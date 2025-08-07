@@ -6,11 +6,15 @@ import httpx
 import os
 from scipy import signal
 from scipy.ndimage import gaussian_filter1d
+from scipy.signal import savgol_filter
 import json
 from typing import Dict, List, Tuple, Optional
+import ffmpeg
+
 
 mp_pose = mp.solutions.pose
 mp_drawing = mp.solutions.drawing_utils
+PoseLandmark = mp_pose.PoseLandmark
 
 class RobustBaseballSwingAnalyzer:
     """
@@ -145,459 +149,7 @@ class RobustBaseballSwingAnalyzer:
                 "frames_used": len(direction_scores)
             }
         }
-
     
-    def _analyze_batting_stance_comprehensive(self, stance_frames):
-        """Comprehensive batting stance analysis using multiple body segments."""
-        left_indicators = []
-        right_indicators = []
-        
-        for lm in stance_frames:
-            try:
-                # Get normalized positions
-                landmarks_normalized = {}
-                landmarks_to_check = [
-                    'LEFT_SHOULDER', 'RIGHT_SHOULDER', 'LEFT_HIP', 'RIGHT_HIP',
-                    'LEFT_KNEE', 'RIGHT_KNEE', 'LEFT_ANKLE', 'RIGHT_ANKLE',
-                    'LEFT_WRIST', 'RIGHT_WRIST'
-                ]
-                
-                valid_landmarks = True
-                for landmark_name in landmarks_to_check:
-                    landmark_idx = getattr(mp_pose.PoseLandmark, landmark_name).value
-                    normalized = self.normalize_landmark_position(lm[landmark_idx], lm)
-                    if normalized is None:
-                        valid_landmarks = False
-                        break
-                    landmarks_normalized[landmark_name] = normalized
-                
-                if not valid_landmarks:
-                    continue
-                
-                # Multi-segment depth consistency analysis
-                segments = {
-                    'upper': (landmarks_normalized['LEFT_SHOULDER']['x'] - landmarks_normalized['RIGHT_SHOULDER']['x']),
-                    'core': (landmarks_normalized['LEFT_HIP']['x'] - landmarks_normalized['RIGHT_HIP']['x']),
-                    'lower': (landmarks_normalized['LEFT_KNEE']['x'] - landmarks_normalized['RIGHT_KNEE']['x']),
-                    'feet': (landmarks_normalized['LEFT_ANKLE']['x'] - landmarks_normalized['RIGHT_ANKLE']['x']),
-                    'hands': (landmarks_normalized['LEFT_WRIST']['x'] - landmarks_normalized['RIGHT_WRIST']['x'])
-                }
-                
-                # Check consistency across body segments
-                segment_values = list(segments.values())
-                consistency = 1.0 - (np.std(segment_values) / (np.mean(np.abs(segment_values)) + 0.1))
-                avg_depth = np.mean(segment_values)
-                
-                # Additional stance width analysis for validation
-                stance_width = abs(landmarks_normalized['LEFT_ANKLE']['y'] - landmarks_normalized['RIGHT_ANKLE']['y'])
-                
-                # Strong indicator: consistent depth + appropriate stance width
-                if consistency > 0.7 and abs(avg_depth) > 0.15 and stance_width > 0.2:
-                    confidence = consistency * min(abs(avg_depth) * 3, 1.0) * min(stance_width, 1.0)
-                    
-                    if avg_depth > 0:  # Left side back = right handed
-                        right_indicators.append(confidence)
-                    else:  # Right side back = left handed
-                        left_indicators.append(confidence)
-                        
-            except:
-                continue
-        
-        total_frames = len(left_indicators) + len(right_indicators)
-        if total_frames < max(3, len(stance_frames) // 4):
-            return {"result": "unknown", "confidence": 0.0, "debug": "Insufficient consistent stance frames"}
-        
-        left_score = np.mean(left_indicators) if left_indicators else 0
-        right_score = np.mean(right_indicators) if right_indicators else 0
-        
-        # Confidence based on consistency and strength of evidence
-        frame_consistency = total_frames / len(stance_frames)
-        confidence = max(left_score, right_score) * frame_consistency
-        
-        if left_score > right_score and left_score > 0.4:
-            return {"result": "left", "confidence": min(confidence, 0.95), 
-                   "debug": f"Left stance score: {left_score:.3f}, frames: {len(left_indicators)}/{len(stance_frames)}"}
-        elif right_score > left_score and right_score > 0.4:
-            return {"result": "right", "confidence": min(confidence, 0.95),
-                   "debug": f"Right stance score: {right_score:.3f}, frames: {len(right_indicators)}/{len(stance_frames)}"}
-        else:
-            return {"result": "unknown", "confidence": 0.0, 
-                   "debug": f"Inconclusive scores - Left: {left_score:.3f}, Right: {right_score:.3f}"}
-    
-    def _analyze_body_asymmetry(self, stance_frames):
-        """Analyze natural body asymmetry in batting stance."""
-        asymmetry_scores = {"left_handed": [], "right_handed": []}
-        
-        for lm in stance_frames:
-            try:
-                # Key asymmetry indicators
-                left_shoulder_norm = self.normalize_landmark_position(lm[mp_pose.PoseLandmark.LEFT_SHOULDER.value], lm)
-                right_shoulder_norm = self.normalize_landmark_position(lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value], lm)
-                left_hip_norm = self.normalize_landmark_position(lm[mp_pose.PoseLandmark.LEFT_HIP.value], lm)
-                right_hip_norm = self.normalize_landmark_position(lm[mp_pose.PoseLandmark.RIGHT_HIP.value], lm)
-                left_knee_norm = self.normalize_landmark_position(lm[mp_pose.PoseLandmark.LEFT_KNEE.value], lm)
-                right_knee_norm = self.normalize_landmark_position(lm[mp_pose.PoseLandmark.RIGHT_KNEE.value], lm)
-                
-                if not all([left_shoulder_norm, right_shoulder_norm, left_hip_norm, right_hip_norm, left_knee_norm, right_knee_norm]):
-                    continue
-                
-                # Analyze weight distribution asymmetry
-                left_weight_line = np.mean([left_shoulder_norm['x'], left_hip_norm['x'], left_knee_norm['x']])
-                right_weight_line = np.mean([right_shoulder_norm['x'], right_hip_norm['x'], right_knee_norm['x']])
-                
-                # Shoulder height asymmetry (natural in batting stance)
-                shoulder_height_diff = left_shoulder_norm['y'] - right_shoulder_norm['y']
-                
-                # Hip angle
-                hip_angle = np.arctan2(right_hip_norm['y'] - left_hip_norm['y'], 
-                                     right_hip_norm['x'] - left_hip_norm['x'])
-                
-                # Combined asymmetry score
-                weight_asymmetry = left_weight_line - right_weight_line
-                
-                # Right-handed: left side typically back, left shoulder often lower
-                if weight_asymmetry > 0.1 and shoulder_height_diff < -0.05:
-                    asymmetry_scores["right_handed"].append(abs(weight_asymmetry) + abs(shoulder_height_diff))
-                # Left-handed: right side back, right shoulder often lower  
-                elif weight_asymmetry < -0.1 and shoulder_height_diff > 0.05:
-                    asymmetry_scores["left_handed"].append(abs(weight_asymmetry) + abs(shoulder_height_diff))
-                    
-            except:
-                continue
-        
-        left_score = np.mean(asymmetry_scores["left_handed"]) if asymmetry_scores["left_handed"] else 0
-        right_score = np.mean(asymmetry_scores["right_handed"]) if asymmetry_scores["right_handed"] else 0
-        
-        total_evidence = len(asymmetry_scores["left_handed"]) + len(asymmetry_scores["right_handed"])
-        
-        if total_evidence < 3:
-            return {"result": "unknown", "confidence": 0.0, "debug": "Insufficient asymmetry data"}
-        
-        confidence = max(left_score, right_score) * (total_evidence / len(stance_frames))
-        
-        if left_score > right_score and left_score > 0.15:
-            return {"result": "left", "confidence": min(confidence, 0.8), 
-                   "debug": f"Left asymmetry: {left_score:.3f}, evidence frames: {len(asymmetry_scores['left_handed'])}"}
-        elif right_score > left_score and right_score > 0.15:
-            return {"result": "right", "confidence": min(confidence, 0.8),
-                   "debug": f"Right asymmetry: {right_score:.3f}, evidence frames: {len(asymmetry_scores['right_handed'])}"}
-        else:
-            return {"result": "unknown", "confidence": 0.0, "debug": "Insufficient asymmetry difference"}
-    
-    def _analyze_limb_positioning(self, stance_frames):
-        """Analyze limb positioning patterns specific to batting stance."""
-        positioning_votes = {"left": 0, "right": 0}
-        total_analyses = 0
-        
-        for lm in stance_frames:
-            try:
-                # Foot positioning analysis
-                left_ankle_norm = self.normalize_landmark_position(lm[mp_pose.PoseLandmark.LEFT_ANKLE.value], lm)
-                right_ankle_norm = self.normalize_landmark_position(lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value], lm)
-                left_knee_norm = self.normalize_landmark_position(lm[mp_pose.PoseLandmark.LEFT_KNEE.value], lm)
-                right_knee_norm = self.normalize_landmark_position(lm[mp_pose.PoseLandmark.RIGHT_KNEE.value], lm)
-                
-                if not all([left_ankle_norm, right_ankle_norm, left_knee_norm, right_knee_norm]):
-                    continue
-                
-                # Lead foot typically forward and weight-bearing leg more vertical
-                foot_forward_diff = left_ankle_norm['x'] - right_ankle_norm['x']
-                knee_vertical_diff = abs(left_knee_norm['x'] - left_ankle_norm['x']) - abs(right_knee_norm['x'] - right_ankle_norm['x'])
-                
-                # Strong foot positioning signal
-                if abs(foot_forward_diff) > 0.2:
-                    if foot_forward_diff > 0:  # Left foot forward = right handed
-                        positioning_votes["right"] += 2
-                    else:  # Right foot forward = left handed
-                        positioning_votes["left"] += 2
-                
-                # Knee alignment signal (weight-bearing leg more vertical)
-                if abs(knee_vertical_diff) > 0.15:
-                    if knee_vertical_diff < 0:  # Left leg more vertical = left lead = right handed
-                        positioning_votes["right"] += 1
-                    else:  # Right leg more vertical = right lead = left handed
-                        positioning_votes["left"] += 1
-                
-                total_analyses += 1
-                
-            except:
-                continue
-        
-        if total_analyses < 3:
-            return {"result": "unknown", "confidence": 0.0, "debug": "Insufficient limb positioning data"}
-        
-        total_votes = positioning_votes["left"] + positioning_votes["right"]
-        
-        if positioning_votes["left"] > positioning_votes["right"]:
-            confidence = positioning_votes["left"] / (total_analyses * 3)  # Max 3 points per frame
-            return {"result": "left", "confidence": min(confidence, 0.85), 
-                   "debug": f"Left positioning votes: {positioning_votes['left']}/{total_votes}"}
-        elif positioning_votes["right"] > positioning_votes["left"]:
-            confidence = positioning_votes["right"] / (total_analyses * 3)
-            return {"result": "right", "confidence": min(confidence, 0.85),
-                   "debug": f"Right positioning votes: {positioning_votes['right']}/{total_votes}"}
-        else:
-            return {"result": "unknown", "confidence": 0.0, "debug": f"Tied positioning votes: {positioning_votes}"}
-    
-    def _analyze_movement_initiation(self, landmarks_over_time):
-        """Analyze initial movement patterns to identify swing initiation side."""
-        video_length = len(landmarks_over_time)
-        
-        # Adaptive frame selection based on video length
-        if video_length <= 40:
-            baseline_end = max(8, video_length // 4)
-            movement_start = baseline_end
-            movement_end = min(video_length - 5, baseline_end + 15)
-        else:
-            baseline_end = 15
-            movement_start = 15
-            movement_end = 35
-        
-        if movement_end <= movement_start:
-            return {"result": "unknown", "confidence": 0.0, "debug": "Insufficient frames for movement analysis"}
-        
-        baseline_frames = landmarks_over_time[:baseline_end]
-        movement_frames = landmarks_over_time[movement_start:movement_end]
-        
-        # Calculate baseline positions for key points
-        baseline_positions = {}
-        landmarks_to_track = ['LEFT_ANKLE', 'RIGHT_ANKLE', 'LEFT_HIP', 'RIGHT_HIP', 'LEFT_SHOULDER', 'RIGHT_SHOULDER']
-        
-        for landmark_name in landmarks_to_track:
-            positions = []
-            for lm in baseline_frames:
-                try:
-                    landmark_idx = getattr(mp_pose.PoseLandmark, landmark_name).value
-                    normalized = self.normalize_landmark_position(lm[landmark_idx], lm)
-                    if normalized:
-                        positions.append((normalized['x'], normalized['y']))
-                except:
-                    continue
-            
-            if len(positions) >= 3:
-                baseline_positions[landmark_name] = {
-                    'x': np.mean([p[0] for p in positions]),
-                    'y': np.mean([p[1] for p in positions]),
-                    'std_x': np.std([p[0] for p in positions]),
-                    'std_y': np.std([p[1] for p in positions])
-                }
-        
-        if len(baseline_positions) < 4:
-            return {"result": "unknown", "confidence": 0.0, "debug": "Insufficient baseline data"}
-        
-        # Analyze movement from baseline
-        movement_scores = {"left_initiation": [], "right_initiation": []}
-        
-        for lm in movement_frames:
-            try:
-                frame_movements = {}
-                for landmark_name in landmarks_to_track:
-                    if landmark_name not in baseline_positions:
-                        continue
-                    
-                    landmark_idx = getattr(mp_pose.PoseLandmark, landmark_name).value
-                    normalized = self.normalize_landmark_position(lm[landmark_idx], lm)
-                    if normalized:
-                        baseline = baseline_positions[landmark_name]
-                        movement_magnitude = np.sqrt(
-                            (normalized['x'] - baseline['x'])**2 + 
-                            (normalized['y'] - baseline['y'])**2
-                        )
-                        # Normalize by baseline variability
-                        movement_significance = movement_magnitude / (baseline['std_x'] + baseline['std_y'] + 0.05)
-                        frame_movements[landmark_name] = movement_significance
-                
-                if len(frame_movements) >= 4:
-                    # Analyze which side shows more movement initiation
-                    left_side_movement = np.mean([frame_movements.get(f'LEFT_{part}', 0) for part in ['ANKLE', 'HIP', 'SHOULDER']])
-                    right_side_movement = np.mean([frame_movements.get(f'RIGHT_{part}', 0) for part in ['ANKLE', 'HIP', 'SHOULDER']])
-                    
-                    movement_diff = abs(left_side_movement - right_side_movement)
-                    
-                    if movement_diff > 0.3:  # Significant asymmetric movement
-                        if left_side_movement > right_side_movement:
-                            # Left side moves first = lead leg = right handed
-                            movement_scores["right_initiation"].append(movement_diff)
-                        else:
-                            # Right side moves first = lead leg = left handed
-                            movement_scores["left_initiation"].append(movement_diff)
-                
-            except:
-                continue
-        
-        left_score = np.mean(movement_scores["left_initiation"]) if movement_scores["left_initiation"] else 0
-        right_score = np.mean(movement_scores["right_initiation"]) if movement_scores["right_initiation"] else 0
-        
-        total_evidence = len(movement_scores["left_initiation"]) + len(movement_scores["right_initiation"])
-        
-        if total_evidence < 3:
-            return {"result": "unknown", "confidence": 0.0, "debug": "Insufficient movement evidence"}
-        
-        confidence = max(left_score, right_score) * min(total_evidence / len(movement_frames), 1.0)
-        
-        if left_score > right_score and left_score > 0.4:
-            return {"result": "left", "confidence": min(confidence, 0.8),
-                   "debug": f"Left initiation score: {left_score:.3f}, evidence: {len(movement_scores['left_initiation'])}"}
-        elif right_score > left_score and right_score > 0.4:
-            return {"result": "right", "confidence": min(confidence, 0.8),
-                   "debug": f"Right initiation score: {right_score:.3f}, evidence: {len(movement_scores['right_initiation'])}"}
-        else:
-            return {"result": "unknown", "confidence": 0.0, "debug": "Insufficient movement asymmetry"}
-    
-    def _analyze_depth_relationships(self, stance_frames):
-        """Analyze depth relationships between body parts for perspective-aware handedness detection."""
-        depth_consistency_scores = {"left": [], "right": []}
-        
-        for lm in stance_frames:
-            try:
-                # Get key landmarks
-                landmarks_normalized = {}
-                key_landmarks = ['LEFT_SHOULDER', 'RIGHT_SHOULDER', 'LEFT_ELBOW', 'RIGHT_ELBOW', 
-                               'LEFT_WRIST', 'RIGHT_WRIST', 'LEFT_HIP', 'RIGHT_HIP']
-                
-                valid_frame = True
-                for landmark_name in key_landmarks:
-                    landmark_idx = getattr(mp_pose.PoseLandmark, landmark_name).value
-                    normalized = self.normalize_landmark_position(lm[landmark_idx], lm)
-                    if normalized is None:
-                        valid_frame = False
-                        break
-                    landmarks_normalized[landmark_name] = normalized
-                
-                if not valid_frame:
-                    continue
-                
-                # Analyze depth relationships
-                # In side view, one side of body should consistently be behind the other
-                left_chain_x = [landmarks_normalized[f'LEFT_{part}']['x'] for part in ['SHOULDER', 'ELBOW', 'WRIST', 'HIP']]
-                right_chain_x = [landmarks_normalized[f'RIGHT_{part}']['x'] for part in ['SHOULDER', 'ELBOW', 'WRIST', 'HIP']]
-                
-                left_avg_depth = np.mean(left_chain_x)
-                right_avg_depth = np.mean(right_chain_x)
-                depth_difference = left_avg_depth - right_avg_depth
-                
-                # Check consistency within each side
-                left_consistency = 1.0 - (np.std(left_chain_x) / 0.5)  # Lower std = more consistent
-                right_consistency = 1.0 - (np.std(right_chain_x) / 0.5)
-                overall_consistency = (left_consistency + right_consistency) / 2
-                
-                # Strong depth separation + good consistency = reliable indicator
-                if abs(depth_difference) > 0.25 and overall_consistency > 0.6:
-                    confidence_score = abs(depth_difference) * overall_consistency
-                    
-                    if depth_difference > 0:  # Left side back = right handed
-                        depth_consistency_scores["right"].append(confidence_score)
-                    else:  # Right side back = left handed
-                        depth_consistency_scores["left"].append(confidence_score)
-                
-            except:
-                continue
-        
-        left_score = np.mean(depth_consistency_scores["left"]) if depth_consistency_scores["left"] else 0
-        right_score = np.mean(depth_consistency_scores["right"]) if depth_consistency_scores["right"] else 0
-        
-        total_evidence = len(depth_consistency_scores["left"]) + len(depth_consistency_scores["right"])
-        
-        if total_evidence < max(2, len(stance_frames) // 5):
-            return {"result": "unknown", "confidence": 0.0, "debug": "Insufficient depth relationship data"}
-        
-        evidence_ratio = total_evidence / len(stance_frames)
-        confidence = max(left_score, right_score) * evidence_ratio
-        
-        if left_score > right_score and left_score > 0.3:
-            return {"result": "left", "confidence": min(confidence, 0.9),
-                   "debug": f"Left depth score: {left_score:.3f}, evidence: {len(depth_consistency_scores['left'])}/{len(stance_frames)}"}
-        elif right_score > left_score and right_score > 0.3:
-            return {"result": "right", "confidence": min(confidence, 0.9),
-                   "debug": f"Right depth score: {right_score:.3f}, evidence: {len(depth_consistency_scores['right'])}/{len(stance_frames)}"}
-        else:
-            return {"result": "unknown", "confidence": 0.0, "debug": f"Insufficient depth separation - Left: {left_score:.3f}, Right: {right_score:.3f}"}
-    
-    def _combine_handedness_methods_adaptive(self, methods, video_length):
-        """Adaptively combine handedness detection methods based on video characteristics."""
-        # Adaptive weights based on video length and method reliability
-        base_weights = {
-            'stance_analysis': 0.30,
-            'asymmetry_analysis': 0.25,
-            'limb_positioning': 0.20,
-            'depth_analysis': 0.15,
-            'movement_pattern': 0.10
-        }
-        
-        # Adjust weights based on video length
-        if video_length < 30:
-            # Shorter videos: rely more on static analysis
-            base_weights['stance_analysis'] *= 1.2
-            base_weights['asymmetry_analysis'] *= 1.1
-            base_weights['movement_pattern'] *= 0.7
-        elif video_length > 80:
-            # Longer videos: movement analysis becomes more reliable
-            base_weights['movement_pattern'] *= 1.3
-            base_weights['stance_analysis'] *= 0.9
-        
-        left_score = 0.0
-        right_score = 0.0
-        total_weight = 0.0
-        debug_info = {}
-        
-        # Confidence threshold for method inclusion
-        min_confidence = max(0.15, 0.3 - (video_length / 200))  # Lower threshold for longer videos
-        
-        for method_name, method_result in methods.items():
-            method_confidence = method_result.get("confidence", 0.0)
-            
-            if method_confidence > min_confidence:
-                base_weight = base_weights.get(method_name, 0.1)
-                # Weight by confidence and consistency
-                effective_weight = base_weight * method_confidence
-                
-                debug_info[method_name] = {
-                    "result": method_result["result"],
-                    "confidence": method_confidence,
-                    "weight": effective_weight,
-                    "debug": method_result.get("debug", "")
-                }
-                
-                if method_result["result"] == "left":
-                    left_score += effective_weight
-                elif method_result["result"] == "right":
-                    right_score += effective_weight
-                
-                total_weight += effective_weight
-        
-        # Adaptive decision thresholds
-        min_total_weight = 0.25 if video_length > 50 else 0.35
-        decision_threshold_ratio = 0.55 if video_length > 40 else 0.65
-        
-        if total_weight > min_total_weight:
-            decision_threshold = total_weight * decision_threshold_ratio
-            
-            if left_score > right_score and left_score > decision_threshold:
-                final_confidence = min((left_score / total_weight) * 1.1, 0.98)
-                return {
-                    "handedness": "left",
-                    "confidence": final_confidence,
-                    "debug": debug_info,
-                    "scores": {"left": left_score, "right": right_score, "total_weight": total_weight},
-                    "video_length": video_length
-                }
-            elif right_score > left_score and right_score > decision_threshold:
-                final_confidence = min((right_score / total_weight) * 1.1, 0.98)
-                return {
-                    "handedness": "right",
-                    "confidence": final_confidence,
-                    "debug": debug_info,
-                    "scores": {"left": left_score, "right": right_score, "total_weight": total_weight},
-                    "video_length": video_length
-                }
-        
-        return {
-            "handedness": "unknown",
-            "confidence": 0.0,
-            "debug": debug_info,
-            "scores": {"left": left_score, "right": right_score, "total_weight": total_weight},
-            "video_length": video_length
-        }
     
     def detect_precise_swing_timing(self, landmarks_over_time, handedness):
         """
@@ -710,114 +262,190 @@ class RobustBaseballSwingAnalyzer:
         return data if len(data['frames']) > max(8, video_length // 6) else None
     
     def _detect_stride_start_adaptive(self, data, video_length):
-        """Adaptive stride start detection that handles different video lengths and zoom levels."""
+        """Robust stride start detection using confidence scoring based on multi-joint signals."""
         if len(data['lead_ankle_x']) < 8:
             return None
-        
-        # Adaptive baseline calculation based on video length
-        if video_length <= 30:
-            baseline_length = max(4, len(data['lead_ankle_x']) // 4)
-        elif video_length <= 60:
-            baseline_length = max(6, len(data['lead_ankle_x']) // 5)
-        else:
-            baseline_length = max(8, len(data['lead_ankle_x']) // 6)
-        
-        # Calculate robust baseline using multiple metrics
+
+        fps = len(data['frames']) / video_length if video_length > 0 else 30
+
+        # Baseline period (setup)
+        baseline_length = max(6, int(fps * 0.2))  # first 0.2s
         baseline_ankle_x = np.median(data['lead_ankle_x'][:baseline_length])
         baseline_ankle_y = np.median(data['lead_ankle_y'][:baseline_length])
         baseline_knee_x = np.median(data['lead_knee_x'][:baseline_length])
-        
-        # Adaptive thresholds based on video characteristics and body scale variation
+
         scale_variation = np.std(data['body_scales'][:baseline_length]) if len(data['body_scales']) > baseline_length else 0.02
-        ankle_x_variation = np.std(data['lead_ankle_x'][:baseline_length])
-        ankle_y_variation = np.std(data['lead_ankle_y'][:baseline_length])
-        
-        # Adaptive thresholds that account for natural variation and zoom changes
-        threshold_x = max(0.08, ankle_x_variation * 3, scale_variation * 2)
-        threshold_y = max(0.06, ankle_y_variation * 2.5, scale_variation * 1.5)
-        
-        # Multi-point smoothing for noise reduction
-        smoothing_sigma = max(1.0, video_length / 80)  # More smoothing for longer videos
-        smoothed_ankle_x = gaussian_filter1d(data['lead_ankle_x'], sigma=smoothing_sigma)
-        smoothed_ankle_y = gaussian_filter1d(data['lead_ankle_y'], sigma=smoothing_sigma)
-        smoothed_knee_x = gaussian_filter1d(data['lead_knee_x'], sigma=smoothing_sigma)
-        
-        # Look for coordinated movement in multiple joints
-        for i in range(baseline_length, len(smoothed_ankle_x) - 2):
-            ankle_movement_x = abs(smoothed_ankle_x[i] - baseline_ankle_x)
-            ankle_movement_y = abs(smoothed_ankle_y[i] - baseline_ankle_y)
-            knee_movement_x = abs(smoothed_knee_x[i] - baseline_knee_x)
-            
-            # Stride involves coordinated ankle and knee movement
-            total_movement = ankle_movement_x + ankle_movement_y + (knee_movement_x * 0.7)
-            
-            # Also check for movement acceleration (derivative)
-            if i >= baseline_length + 2:
-                movement_acceleration = (
-                    abs(smoothed_ankle_x[i] - smoothed_ankle_x[i-2]) + 
-                    abs(smoothed_ankle_y[i] - smoothed_ankle_y[i-2])
-                ) / 2
-                
-                if (ankle_movement_x > threshold_x or ankle_movement_y > threshold_y or 
-                    total_movement > threshold_x + threshold_y) and movement_acceleration > 0.03:
-                    return data['frames'][i]
-            
-            elif ankle_movement_x > threshold_x or ankle_movement_y > threshold_y:
+        ankle_range_x = np.std(data['lead_ankle_x'][:baseline_length])
+        ankle_range_y = np.std(data['lead_ankle_y'][:baseline_length])
+        threshold_x = max(0.08, ankle_range_x * 3, scale_variation * 2)
+        threshold_y = max(0.06, ankle_range_y * 2.5, scale_variation * 1.5)
+
+        # Smoothing
+        sigma = max(1.0, video_length / 80)
+        ankle_x = gaussian_filter1d(data['lead_ankle_x'], sigma=sigma)
+        ankle_y = gaussian_filter1d(data['lead_ankle_y'], sigma=sigma)
+        knee_x = gaussian_filter1d(data['lead_knee_x'], sigma=sigma)
+
+        best_frame = None
+        best_score = 0
+
+        for i in range(baseline_length + 2, len(ankle_x) - 3):
+            score = 0.0
+
+            dx = abs(ankle_x[i] - baseline_ankle_x)
+            dy = abs(ankle_y[i] - baseline_ankle_y)
+            dk = abs(knee_x[i] - baseline_knee_x)
+
+            # 1. Ankle starts moving forward/down
+            if dx > threshold_x * 0.6:
+                score += 0.3
+            if dy > threshold_y * 0.5:
+                score += 0.3
+
+            # 2. Knee movement helps confirm stride
+            if dk > 0.05:
+                score += 0.2
+
+            # 3. Acceleration of ankle
+            ax = (ankle_x[i] - ankle_x[i-2]) / 2
+            ay = (ankle_y[i] - ankle_y[i-2]) / 2
+            accel = np.sqrt(ax**2 + ay**2)
+            if accel > 0.01:
+                score += 0.2
+
+            # 4. Sustained movement (forward motion continues)
+            sustained = abs(ankle_x[i+2] - ankle_x[i]) > 0.03
+            if sustained:
+                score += 0.2
+
+            # 5. Timing bonus — if it's early in the swing (~first 1/3)
+            if i < len(ankle_x) // 3:
+                score += 0.1
+
+            # Keep best-scoring frame
+            if score >= 0.6:
                 return data['frames'][i]
-        
+
+            if score > best_score:
+                best_score = score
+                best_frame = data['frames'][i]
+
+        # Fallback to best guess
+        if best_score > 0.4:
+            return best_frame
+
         return None
     
+
+
+
     def _detect_foot_plant_adaptive(self, data, stride_start, video_length):
-        """Adaptive foot plant detection using multi-signal analysis."""
-        if stride_start is None or len(data['lead_ankle_y']) < 12:
+        """
+        Detects foot plant using dual-ankle comparison with intelligent fallback to best candidate.
+        """
+        if stride_start is None or len(data['lead_ankle_y']) < 10:
+            print("🚫 Not enough ankle data or stride_start is None.")
             return None
-        
-        # Find stride start index with buffer
-        start_idx = 0
-        for i, frame in enumerate(data['frames']):
-            if frame >= stride_start:
-                start_idx = max(0, i - 1)  # Start slightly before for context
-                break
-        
-        if start_idx >= len(data['lead_ankle_y']) - 6:
+
+        if 'back_ankle_y' not in data or len(data['back_ankle_y']) != len(data['lead_ankle_y']):
+            print("⚠️ No trail ankle data available, falling back to single-ankle method.")
             return None
-        
-        # Adaptive smoothing based on video length
-        smoothing_sigma = max(0.8, video_length / 100)
-        smoothed_ankle_y = gaussian_filter1d(data['lead_ankle_y'], sigma=smoothing_sigma)
-        smoothed_knee_y = gaussian_filter1d(data['lead_knee_y'], sigma=smoothing_sigma)
-        
-        # Multi-signal foot plant detection
-        search_window = min(len(smoothed_ankle_y) - start_idx - 3, 
-                           max(8, video_length // 4))
-        
-        for i in range(start_idx + 2, start_idx + search_window):
-            if i >= len(smoothed_ankle_y) - 3:
-                break
-            
-            # Ankle velocity analysis
-            ankle_velocity = (smoothed_ankle_y[i+1] - smoothed_ankle_y[i-1]) / 2
-            ankle_acceleration = (smoothed_ankle_y[i+2] - 2*smoothed_ankle_y[i] + smoothed_ankle_y[i-2]) / 4
-            
-            # Knee velocity for confirmation
-            knee_velocity = (smoothed_knee_y[i+1] - smoothed_knee_y[i-1]) / 2
-            
-            # Foot plant: downward movement followed by deceleration/reversal
-            # Plus knee movement slowing (weight acceptance)
-            if (ankle_velocity < -0.02 and ankle_acceleration > 0.015 and 
-                abs(knee_velocity) < 0.03):
-                return data['frames'][i]
-            
-            # Alternative: sharp deceleration after movement
-            if i > start_idx + 3:
-                prev_velocity = (smoothed_ankle_y[i-1] - smoothed_ankle_y[i-3]) / 2
-                velocity_change = abs(ankle_velocity - prev_velocity)
-                
-                if velocity_change > 0.04 and abs(ankle_velocity) < abs(prev_velocity) * 0.4:
+
+        try:
+            stride_index = next(i for i, f in enumerate(data['frames']) if f >= stride_start)
+        except StopIteration:
+            print("⚠️ Stride start not found in frames, using index 0.")
+            stride_index = 0
+
+        fps = len(data['frames']) / video_length if video_length > 0 else 30
+        fps = max(fps, 10)
+        smoothing_sigma = max(0.8, fps / 60)
+
+        smoothed_lead_y = gaussian_filter1d(data['lead_ankle_y'], sigma=smoothing_sigma)
+        smoothed_back_y = gaussian_filter1d(data['back_ankle_y'], sigma=smoothing_sigma)
+        ankle_separation = smoothed_back_y - smoothed_lead_y
+
+        search_start = stride_index
+        search_duration = int(4.5 * fps)
+        search_end = min(search_start + search_duration, len(smoothed_lead_y) - 10)
+
+        min_stability_frames = max(2, int(0.08 * fps))
+        max_stability_frames = max(10, int(0.5 * fps))
+        stability_threshold = 0.0008
+
+        baseline_abs_separation = np.median(np.abs(ankle_separation[stride_index:stride_index + min(20, len(ankle_separation)//4)]))
+        convergence_threshold = min(0.02, baseline_abs_separation * 0.3)
+
+        print(f"🦶 Convergence threshold: {convergence_threshold:.4f}")
+        print(f"🕒 Stability: {min_stability_frames}-{max_stability_frames} frames | σ: {smoothing_sigma:.2f} | FPS: {fps:.2f}")
+
+        best_score = -1
+        best_frame = None
+
+        for i in range(search_start + 1, search_end - max_stability_frames):
+            prev_lead = smoothed_lead_y[i - 1]
+            curr_lead = smoothed_lead_y[i]
+            next_lead = smoothed_lead_y[i + 1]
+            is_local_min = prev_lead > curr_lead < next_lead
+
+            curr_sep = ankle_separation[i]
+            curr_abs_sep = abs(curr_sep)
+            feet_converged = curr_abs_sep < convergence_threshold
+
+            # Check nearby for convergence
+            feet_converged_nearby = (
+                feet_converged or
+                (i > 0 and abs(ankle_separation[i - 1]) < convergence_threshold) or
+                (i + 1 < len(ankle_separation) and abs(ankle_separation[i + 1]) < convergence_threshold)
+            )
+
+            score = 0
+            if is_local_min:
+                score += 1
+            if feet_converged_nearby:
+                score += 1
+
+            # Try to find a stability window
+            for window_size in range(min_stability_frames, max_stability_frames + 1):
+                if i + window_size >= len(smoothed_lead_y):
+                    break
+
+                lead_var = np.var(smoothed_lead_y[i:i + window_size])
+                sep_window = np.abs(ankle_separation[i:i + window_size])
+                sep_var = np.var(sep_window)
+                sep_mean = np.mean(sep_window)
+
+                lead_stable = lead_var < stability_threshold
+                conv_stable = sep_var < stability_threshold * 1.5
+                conv_maintained = sep_mean < convergence_threshold * 1.2
+
+                if lead_stable:
+                    score += 0.5
+                if conv_stable and conv_maintained:
+                    score += 0.5
+
+                if score >= 2.0:
+                    print(f"🎯 FOOT PLANT ~CONFIRMED at frame {data['frames'][i]} (score {score})")
                     return data['frames'][i]
-        
+                break  # Exit after 1 window attempt to keep search fast
+
+            if score > best_score:
+                best_score = score
+                best_frame = data['frames'][i]
+
+            print(f"🧪 Frame {data['frames'][i]}: local_min={is_local_min}, converged_nearby={feet_converged_nearby}, score={score}")
+
+        print("⚠️ No perfect foot plant frame found. Best guess:")
+
+        if best_score >= 1.5:
+            print(f"✅ Using best candidate frame {best_frame} with score {best_score}")
+            return best_frame
+
+        print("🚫 No sufficiently confident foot plant frame.")
         return None
-    
+
+
+
     def _detect_swing_start_adaptive(self, data, phases, video_length):
         """Enhanced swing start detection using multiple biomechanical indicators."""
         # Determine search start based on available phases
@@ -1478,6 +1106,49 @@ class RobustBaseballSwingAnalyzer:
             'data_quality': 0.0
         }
 
+    def calculate_torso_lean_at_frame(self, landmarks, handedness) -> dict:
+        """
+        Calculates torso lean angle at a given frame using normalized mid-shoulder and mid-hip positions.
+        Positive angle = forward lean toward plate; negative = leaning back.
+        """
+        try:
+            # Midpoints between shoulders and hips
+            mid_shoulder = np.array([
+                (landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].x + landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x) / 2,
+                (landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].y + landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y) / 2
+            ])
+            mid_hip = np.array([
+                (landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].x + landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value].x) / 2,
+                (landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].y + landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value].y) / 2
+            ])
+
+            # Torso vector
+            torso_vector = mid_shoulder - mid_hip
+            vertical_ref = np.array([0, -1])  # Upward vertical
+
+            # Angle between torso vector and vertical
+            dot_product = np.dot(torso_vector, vertical_ref)
+            magnitudes = np.linalg.norm(torso_vector) * np.linalg.norm(vertical_ref)
+            angle_rad = np.arccos(np.clip(dot_product / magnitudes, -1.0, 1.0))
+            angle_deg = np.degrees(angle_rad)
+
+            # Determine sign based on forward or backward lean
+            forward_lean = (torso_vector[0] > 0) if handedness == "right" else (torso_vector[0] < 0)
+            if not forward_lean:
+                angle_deg *= -1
+
+            return {
+                "torso_lean_angle": angle_deg,
+                "forward_lean": forward_lean,
+                "torso_vector": torso_vector.tolist()
+            }
+
+        except Exception as e:
+            return {
+                "torso_lean_angle": None,
+                "error": str(e)
+            }
+
 
 # Keep the same video loading functions as the original
 async def analyze_video_from_url(url: str):
@@ -1498,6 +1169,7 @@ async def analyze_video_from_url(url: str):
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
         tmp.write(video_bytes)
         video_path = tmp.name
+
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -1555,6 +1227,51 @@ async def analyze_video_from_url(url: str):
     
     # Enhanced swing phase detection
     swing_phases = analyzer.detect_precise_swing_timing(landmarks_over_time, handedness)
+
+    # Log hip-shoulder separation at foot plant if available
+    foot_plant_frame = swing_phases.get("foot_plant")
+    if foot_plant_frame is not None:
+        try:
+            lm = landmarks_over_time[foot_plant_frame]
+            if handedness == "left":
+                lead_shoulder = lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value]
+                back_shoulder = lm[mp_pose.PoseLandmark.LEFT_SHOULDER.value]
+                lead_hip = lm[mp_pose.PoseLandmark.RIGHT_HIP.value]
+                back_hip = lm[mp_pose.PoseLandmark.LEFT_HIP.value]
+            else:
+                lead_shoulder = lm[mp_pose.PoseLandmark.LEFT_SHOULDER.value]
+                back_shoulder = lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value]
+                lead_hip = lm[mp_pose.PoseLandmark.LEFT_HIP.value]
+                back_hip = lm[mp_pose.PoseLandmark.RIGHT_HIP.value]
+
+            hip_angle = np.degrees(np.arctan2(back_hip.y - lead_hip.y, back_hip.x - lead_hip.x))
+            shoulder_angle = np.degrees(np.arctan2(back_shoulder.y - lead_shoulder.y, back_shoulder.x - lead_shoulder.x))
+            separation = abs(((shoulder_angle - hip_angle + 180) % 360) - 180)  # Normalize and take absolute value
+
+            print(f"📐 Separation at foot plant (Frame {foot_plant_frame}): {separation:.1f}°")
+
+            if separation < 20 or separation > 40:
+                feedback.append({
+                    "frame": foot_plant_frame,
+                    "issue": f"Hip-shoulder separation at foot plant is {separation:.1f}° (ideal: 20–40°)",
+                    "suggested_drill": "Improve separation timing and coil mechanics with rotational drills",
+                    "severity": "medium"
+                })
+
+
+            torso_lean_result = analyzer.calculate_torso_lean_at_frame(landmarks_over_time[foot_plant_frame], handedness)
+            angle = torso_lean_result.get("torso_lean_angle")
+            
+            if angle is not None:
+                direction = "forward" if angle > 0 else "backward"
+                print(f"📏 Torso lean at foot plant (Frame {foot_plant_frame}): {angle:.1f}° ({direction})")
+            else:
+                print("⚠️ Could not calculate torso lean at foot plant.")
+
+        
+        except Exception as e:
+            print(f"⚠️ Could not compute separation at foot plant: {e}")
+
     
     print("⏱️ Swing phases detected:")
     for phase, frame in swing_phases.items():
@@ -1708,6 +1425,48 @@ async def generate_annotated_video(video_url: str, swing_phases: dict) -> str:
         if results.pose_landmarks:
             mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
 
+            # ✅ Draw hip–shoulder separation angle at foot plant
+            if frame_idx == swing_phases.get("foot_plant"):
+                landmarks = results.pose_landmarks.landmark
+
+                # Get shoulder and hip points
+                left_shoulder = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value]
+                right_shoulder = landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value]
+                left_hip = landmarks[mp_pose.PoseLandmark.LEFT_HIP.value]
+                right_hip = landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value]
+
+                # Convert normalized coordinates to pixel values
+                def denorm(point):
+                    return int(point.x * width), int(point.y * height)
+
+                ls = denorm(left_shoulder)
+                rs = denorm(right_shoulder)
+                lh = denorm(left_hip)
+                rh = denorm(right_hip)
+
+                # Draw lines
+                cv2.line(frame, ls, rs, (0, 255, 255), 2)  # yellow = shoulders
+                cv2.line(frame, lh, rh, (255, 0, 255), 2)  # magenta = hips
+
+                # Calculate angles
+                shoulder_angle = np.degrees(np.arctan2(rs[1] - ls[1], rs[0] - ls[0]))
+                hip_angle = np.degrees(np.arctan2(rh[1] - lh[1], rh[0] - lh[0]))
+                separation = shoulder_angle - hip_angle
+                separation = ((separation + 180) % 360) - 180  # Normalize to -180 to 180
+                separation = abs(separation)
+
+                # Display angle on screen
+                cv2.putText(
+                    frame,
+                    f"Hip-Shoulder Sep: {separation:.1f} degrees",
+                    (30, 90),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.9,
+                    (255, 255, 0),
+                    2
+                )
+
+
         # Enhanced phase labeling with colors
         phase_colors = {
             "stride_start": (0, 255, 255),    # Yellow
@@ -1740,3 +1499,6 @@ async def generate_annotated_video(video_url: str, swing_phases: dict) -> str:
 
     print(f"✅ Enhanced annotated video saved to: {output_path}")
     return output_path
+
+
+
