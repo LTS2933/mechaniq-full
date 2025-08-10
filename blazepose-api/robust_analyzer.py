@@ -174,32 +174,34 @@ class RobustBaseballSwingAnalyzer:
         # Adaptive phase detection based on video length
         phases["stride_start"] = self._detect_stride_start_adaptive(movement_data, video_length)
         phases["foot_plant"] = self._detect_foot_plant_adaptive(movement_data, phases["stride_start"], video_length)
-        phases["swing_start"] = self._detect_swing_start_adaptive(movement_data, phases, video_length)
-        phases["contact"] = self._detect_contact_adaptive(movement_data, phases["swing_start"], video_length)
+        phases["swing_start"] = self._detect_swing_start_adaptive(movement_data, phases["foot_plant"],video_length, handedness)
+        phases["contact"] = self._detect_contact_adaptive(movement_data, phases["swing_start"], video_length, handedness)
         phases["follow_through"] = self._detect_follow_through_adaptive(movement_data, phases["contact"], video_length)
         
         return phases
-    
+
     def _extract_adaptive_movement_data(self, landmarks_over_time, is_lefty, video_length):
-        """Extract movement data with adaptive sampling based on video characteristics."""
+        """Extract movement data with adaptive sampling based on video characteristics.
+        Adds optional face center (median of available nose/eyes/ears) and keeps arrays aligned.
+        """
         # Define body parts based on handedness
         if is_lefty:
             lead_side = "RIGHT"
             back_side = "LEFT"
         else:
-            lead_side = "LEFT"  
+            lead_side = "LEFT"
             back_side = "RIGHT"
-        
+
         data = {
             'frames': [],
             'video_length': video_length,
             # Enhanced data tracking
             'lead_ankle_x': [], 'lead_ankle_y': [],
             'back_ankle_x': [], 'back_ankle_y': [],
-            'lead_knee_x': [], 'lead_knee_y': [],
-            'back_knee_x': [], 'back_knee_y': [],
-            'lead_hip_x': [], 'lead_hip_y': [],
-            'back_hip_x': [], 'back_hip_y': [],
+            'lead_knee_x': [],  'lead_knee_y':  [],
+            'back_knee_x': [],  'back_knee_y':  [],
+            'lead_hip_x': [],   'lead_hip_y':   [],
+            'back_hip_x': [],   'back_hip_y':   [],
             'lead_shoulder_x': [], 'lead_shoulder_y': [],
             'back_shoulder_x': [], 'back_shoulder_y': [],
             'lead_wrist_x': [], 'lead_wrist_y': [],
@@ -207,59 +209,95 @@ class RobustBaseballSwingAnalyzer:
             'lead_elbow_x': [], 'lead_elbow_y': [],
             'back_elbow_x': [], 'back_elbow_y': [],
             # Additional tracking for better analysis
-            'body_scales': [],  # Track zoom level changes
+            'body_scales': [],              # Track zoom level changes
             'hip_center_x': [], 'hip_center_y': [],
+            # NEW: optional face center (kept aligned; may contain NaN)
+            'face_center_x': [], 'face_center_y': [],
         }
-        
+
         landmark_indices = {
-            'lead_ankle': getattr(mp_pose.PoseLandmark, f'{lead_side}_ANKLE').value,
-            'back_ankle': getattr(mp_pose.PoseLandmark, f'{back_side}_ANKLE').value,
-            'lead_knee': getattr(mp_pose.PoseLandmark, f'{lead_side}_KNEE').value,
-            'back_knee': getattr(mp_pose.PoseLandmark, f'{back_side}_KNEE').value,
-            'lead_hip': getattr(mp_pose.PoseLandmark, f'{lead_side}_HIP').value,
-            'back_hip': getattr(mp_pose.PoseLandmark, f'{back_side}_HIP').value,
-            'lead_shoulder': getattr(mp_pose.PoseLandmark, f'{lead_side}_SHOULDER').value,
-            'back_shoulder': getattr(mp_pose.PoseLandmark, f'{back_side}_SHOULDER').value,
-            'lead_wrist': getattr(mp_pose.PoseLandmark, f'{lead_side}_WRIST').value,
-            'back_wrist': getattr(mp_pose.PoseLandmark, f'{back_side}_WRIST').value,
-            'lead_elbow': getattr(mp_pose.PoseLandmark, f'{lead_side}_ELBOW').value,
-            'back_elbow': getattr(mp_pose.PoseLandmark, f'{back_side}_ELBOW').value,
+            'lead_ankle':   getattr(mp_pose.PoseLandmark, f'{lead_side}_ANKLE').value,
+            'back_ankle':   getattr(mp_pose.PoseLandmark, f'{back_side}_ANKLE').value,
+            'lead_knee':    getattr(mp_pose.PoseLandmark, f'{lead_side}_KNEE').value,
+            'back_knee':    getattr(mp_pose.PoseLandmark, f'{back_side}_KNEE').value,
+            'lead_hip':     getattr(mp_pose.PoseLandmark, f'{lead_side}_HIP').value,
+            'back_hip':     getattr(mp_pose.PoseLandmark, f'{back_side}_HIP').value,
+            'lead_shoulder':getattr(mp_pose.PoseLandmark, f'{lead_side}_SHOULDER').value,
+            'back_shoulder':getattr(mp_pose.PoseLandmark, f'{back_side}_SHOULDER').value,
+            'lead_wrist':   getattr(mp_pose.PoseLandmark, f'{lead_side}_WRIST').value,
+            'back_wrist':   getattr(mp_pose.PoseLandmark, f'{back_side}_WRIST').value,
+            'lead_elbow':   getattr(mp_pose.PoseLandmark, f'{lead_side}_ELBOW').value,
+            'back_elbow':   getattr(mp_pose.PoseLandmark, f'{back_side}_ELBOW').value,
         }
-        
+
+        # Face landmarks (optional; we won't reject the frame if these are missing)
+        face_indices = {
+            'nose':  mp_pose.PoseLandmark.NOSE.value,
+            'l_eye': mp_pose.PoseLandmark.LEFT_EYE.value,
+            'r_eye': mp_pose.PoseLandmark.RIGHT_EYE.value,
+            'l_ear': mp_pose.PoseLandmark.LEFT_EAR.value,
+            'r_ear': mp_pose.PoseLandmark.RIGHT_EAR.value,
+        }
+
         for frame_idx, landmarks in enumerate(landmarks_over_time):
             try:
                 frame_data = {}
                 all_present = True
-                
-                # Get body metrics for this frame
+
+                # 1) Body metrics for normalization
                 body_metrics = self.calculate_adaptive_body_metrics(landmarks)
-                if not body_metrics or not body_metrics['measurements_valid']:
-                    continue
-                
-                # Store body scale and hip center for tracking zoom/movement
-                data['body_scales'].append(body_metrics['scale'])
-                data['hip_center_x'].append(body_metrics['hip_center'][0])
-                data['hip_center_y'].append(body_metrics['hip_center'][1])
-                
-                # Get normalized positions for all landmarks
+                if not body_metrics or not body_metrics.get('measurements_valid', False):
+                    continue  # skip frame if we can't normalize reliably
+
+                # 2) REQUIRED body joints (normalized); if any missing, skip the frame
                 for part_name, landmark_idx in landmark_indices.items():
-                    normalized = self.normalize_landmark_position(landmarks[landmark_idx], landmarks)
-                    if normalized:
-                        frame_data[f'{part_name}_x'] = normalized['x']
-                        frame_data[f'{part_name}_y'] = normalized['y']
+                    norm = self.normalize_landmark_position(landmarks[landmark_idx], landmarks)
+                    if norm:
+                        frame_data[f'{part_name}_x'] = norm['x']
+                        frame_data[f'{part_name}_y'] = norm['y']
                     else:
                         all_present = False
                         break
-                
-                if all_present:
-                    data['frames'].append(frame_idx)
-                    for key, value in frame_data.items():
-                        data[key].append(value)
-                        
-            except:
+
+                if not all_present:
+                    continue
+
+                # 3) OPTIONAL face center (median of available nose/eyes/ears); keep frame even if missing
+                face_x_vals, face_y_vals = [], []
+                for key in ('nose', 'l_eye', 'r_eye', 'l_ear', 'r_ear'):
+                    li = face_indices[key]
+                    norm = self.normalize_landmark_position(landmarks[li], landmarks)
+                    if norm is not None and np.isfinite(norm.get('x', np.nan)) and np.isfinite(norm.get('y', np.nan)):
+                        face_x_vals.append(norm['x'])
+                        face_y_vals.append(norm['y'])
+
+                if face_x_vals:
+                    face_cx = float(np.median(face_x_vals))
+                    face_cy = float(np.median(face_y_vals))
+                else:
+                    face_cx = float('nan')
+                    face_cy = float('nan')
+
+                # 4) ACCEPT the frame: append everything in lockstep so arrays stay aligned
+                data['frames'].append(frame_idx)
+
+                data['body_scales'].append(body_metrics['scale'])
+                data['hip_center_x'].append(body_metrics['hip_center'][0])
+                data['hip_center_y'].append(body_metrics['hip_center'][1])
+
+                for key, value in frame_data.items():
+                    data[key].append(value)
+
+                data['face_center_x'].append(face_cx)
+                data['face_center_y'].append(face_cy)
+
+            except Exception:
+                # Be robust to occasional frames with odd data
                 continue
-        
+
+        # Require a minimum number of accepted frames
         return data if len(data['frames']) > max(8, video_length // 6) else None
+
     
     def _detect_stride_start_adaptive(self, data, video_length):
         """Robust stride start detection using confidence scoring based on multi-joint signals."""
@@ -376,8 +414,8 @@ class RobustBaseballSwingAnalyzer:
         baseline_abs_separation = np.median(np.abs(ankle_separation[stride_index:stride_index + min(20, len(ankle_separation)//4)]))
         convergence_threshold = min(0.02, baseline_abs_separation * 0.3)
 
-        print(f"🦶 Convergence threshold: {convergence_threshold:.4f}")
-        print(f"🕒 Stability: {min_stability_frames}-{max_stability_frames} frames | σ: {smoothing_sigma:.2f} | FPS: {fps:.2f}")
+        #print(f"🦶 Convergence threshold: {convergence_threshold:.4f}")
+        #print(f"🕒 Stability: {min_stability_frames}-{max_stability_frames} frames | σ: {smoothing_sigma:.2f} | FPS: {fps:.2f}")
 
         best_score = -1
         best_frame = None
@@ -444,324 +482,288 @@ class RobustBaseballSwingAnalyzer:
         print("🚫 No sufficiently confident foot plant frame.")
         return None
 
+    def _detect_swing_start_adaptive(
+        self,
+        data,
+        foot_plant_frame: int | None,
+        video_length: int,
+        handedness: str,
+        *,
+        fps: float | None = None,           # only used to cap to ~3s
+        smooth_sigma: float = 0.6,
+        min_dx_units: float = 0.0015,
+        min_center_step_units: float = 0.001
+    ):
+        if foot_plant_frame is None:
+            print("❌ No foot plant frame provided. Cannot determine swing start.")
+            return None
 
+        def _smooth1d(x, sigma):
+            x = np.asarray(x, float)
+            if sigma and sigma > 0:
+                n = len(x); idx = np.arange(n); m = np.isfinite(x)
+                if n and (not m.all()) and m.any():
+                    x = x.copy(); x[~m] = np.interp(idx[~m], idx[m], x[m])
+                from scipy.ndimage import gaussian_filter1d
+                x = gaussian_filter1d(x, sigma=sigma)
+            return x
 
-    def _detect_swing_start_adaptive(self, data, phases, video_length):
-        """Enhanced swing start detection using multiple biomechanical indicators."""
-        # Determine search start based on available phases
-        search_start_idx = 0
-        if phases.get("foot_plant"):
-            for i, frame in enumerate(data['frames']):
-                if frame >= phases["foot_plant"]:
-                    search_start_idx = max(0, i - 2)
-                    break
-        elif phases.get("stride_start"):
-            for i, frame in enumerate(data['frames']):
-                if frame >= phases["stride_start"]:
-                    search_start_idx = max(0, i + 2)  # Swing typically starts after stride
-                    break
-        
-        if len(data['lead_wrist_x']) < search_start_idx + 8:
+        frames = np.asarray(data["frames"])
+        plant_i = int(np.searchsorted(frames, foot_plant_frame, side="left"))
+        if plant_i >= len(frames) - 2:
+            print("❌ Not enough frames after foot plant.")
             return None
-        
-        # Adaptive search window
-        search_window = min(len(data['frames']) - search_start_idx - 3,
-                           max(10, video_length // 3))
-        
-        # Multiple swing initiation indicators
-        indicators = []
-        
-        # Indicator 1: Hip rotation acceleration
-        hip_indicator = self._detect_hip_rotation_start_adaptive(data, search_start_idx, search_window)
-        if hip_indicator:
-            indicators.append(("hip_rotation", hip_indicator, 3))  # High weight
-        
-        # Indicator 2: Hand/bat acceleration
-        hand_indicator = self._detect_hand_acceleration_start_adaptive(data, search_start_idx, search_window)
-        if hand_indicator:
-            indicators.append(("hand_acceleration", hand_indicator, 3))  # High weight
-        
-        # Indicator 3: Shoulder sequence initiation
-        shoulder_indicator = self._detect_shoulder_sequence_start_adaptive(data, search_start_idx, search_window)
-        if shoulder_indicator:
-            indicators.append(("shoulder_sequence", shoulder_indicator, 2))  # Medium weight
-        
-        # Indicator 4: Weight transfer detection
-        weight_indicator = self._detect_weight_transfer_start_adaptive(data, search_start_idx, search_window)
-        if weight_indicator:
-            indicators.append(("weight_transfer", weight_indicator, 2))  # Medium weight
-        
-        # Indicator 5: Kinetic chain initiation
-        kinetic_indicator = self._detect_kinetic_chain_start_adaptive(data, search_start_idx, search_window)
-        if kinetic_indicator:
-            indicators.append(("kinetic_chain", kinetic_indicator, 2))  # Medium weight
-        
-        if not indicators:
-            return None
-        
-        # Weighted consensus finding
-        frame_weights = {}
-        for indicator_name, frame, weight in indicators:
-            for check_frame in range(frame - 2, frame + 3):
-                if check_frame not in frame_weights:
-                    frame_weights[check_frame] = 0
-                frame_weights[check_frame] += weight * (3 - abs(check_frame - frame)) / 3  # Distance decay
-        
-        # Find frame with highest weighted support
-        if frame_weights:
-            best_frame = max(frame_weights.items(), key=lambda x: x[1])
-            if best_frame[1] >= 4:  # Minimum weighted threshold
-                return best_frame[0]
-        
-        # Fallback: use earliest high-confidence indicator
-        high_confidence_indicators = [(name, frame) for name, frame, weight in indicators if weight >= 3]
-        if high_confidence_indicators:
-            return min(frame for _, frame in high_confidence_indicators)
-        
-        return min(frame for _, frame, _ in indicators) if indicators else None
-    
-    def _detect_hip_rotation_start_adaptive(self, data, start_idx, search_window):
-        """Adaptive hip rotation detection."""
-        end_idx = min(start_idx + search_window, len(data['lead_hip_x']))
-        
-        if end_idx - start_idx < 6:
-            return None
-        
-        # Calculate hip angles with enhanced smoothing
-        hip_angles = []
-        for i in range(start_idx, end_idx):
-            try:
-                angle = np.degrees(np.arctan2(
-                    data['back_hip_y'][i] - data['lead_hip_y'][i],
-                    data['back_hip_x'][i] - data['lead_hip_x'][i]
-                ))
-                hip_angles.append(angle)
-            except:
-                hip_angles.append(hip_angles[-1] if hip_angles else 0)
-        
-        if len(hip_angles) < 6:
-            return None
-        
-        # Smooth angles and calculate angular velocity and acceleration
-        smoothed_angles = gaussian_filter1d(hip_angles, sigma=1.2)
-        
-        for i in range(3, len(smoothed_angles) - 3):
-            # Angular velocity (degrees per frame)
-            angular_velocity = (smoothed_angles[i+2] - smoothed_angles[i-2]) / 4
-            # Angular acceleration  
-            angular_acceleration = (smoothed_angles[i+3] - 2*smoothed_angles[i] + smoothed_angles[i-3]) / 9
-            
-            # Look for significant rotational initiation
-            if abs(angular_velocity) > 2.5 and abs(angular_acceleration) > 1.0:
-                return data['frames'][start_idx + i]
-        
+
+        # --- cap search to ~3 seconds after FP (or 90 frames if fps unknown) ---
+        max_after = int(3 * fps) if (fps and fps > 0) else 90
+        search_end_i = min(len(frames) - 1, plant_i + max_after)
+        print(f"🔎 Swing-start scan window: idx[{plant_i+1}..{search_end_i}]")
+
+        # --- mid-hands and mid-shoulders (smoothed) ---
+        Lx = _smooth1d(data["lead_wrist_x"], smooth_sigma)
+        Bx = _smooth1d(data["back_wrist_x"],  smooth_sigma)
+        Hx = 0.5*(Lx + Bx)
+
+        Lsx = _smooth1d(data["lead_shoulder_x"], 0.8)
+        Bsx = _smooth1d(data["back_shoulder_x"], 0.8)
+        Sx  = 0.5*(Lsx + Bsx)
+
+        # OPTIONAL: blend in hip center to make the “center line” even stabler
+        # Hx_c = np.asarray(data.get("hip_center_x", [np.nan]*len(Sx)), float)
+        # if np.isfinite(Hx_c).sum() > len(Sx)*0.7:
+        #     center_series = 0.5*Sx + 0.5*_smooth1d(Hx_c, 1.0)
+        # else:
+        #     center_series = Sx
+
+        center_series = Sx  # using shoulders only for now
+
+        # --- FIXED center at foot plant ---
+        center_fp = float(center_series[plant_i])
+
+        # direction gate (same as before)
+        sign = +1.0 if handedness == "right" else (-1.0 if handedness == "left" else None)
+
+        # --- first qualifying inward X step after FP (toward fixed FP center) ---
+        start_i = plant_i + 1
+        for i in range(start_i, search_end_i + 1):
+            dx = Hx[i] - Hx[i-1]
+
+            # distance to fixed FP center, not the moving torso center
+            cx_prev = abs(Hx[i-1] - center_fp)
+            cx_curr = abs(Hx[i]   - center_fp)
+            toward_center = (cx_curr <= cx_prev - abs(min_center_step_units))
+
+            dir_ok = (sign is None) or (sign * dx >= abs(min_dx_units))
+
+            #print(
+              #  f"🧪 idx {i}: Hx={Hx[i]:.4f}, Cfp={center_fp:.4f}, dx={dx:.5f}, "
+              #  f"|Hx-Cfp|: {cx_prev:.4f}→{cx_curr:.4f} ({'↓' if toward_center else '↔/↑'}), "
+              #  f"dir_ok={dir_ok}"
+            # )
+
+            if toward_center and dir_ok:
+                frame = int(frames[i])
+                print(f"✅ Swing start (first inward X step to FP center) at frame {frame} (idx {i})")
+                return frame
+
+        print("🔻 No inward step toward FP center found within the capped window.")
         return None
     
-    def _detect_hand_acceleration_start_adaptive(self, data, start_idx, search_window):
-        """Adaptive hand acceleration detection with both hands."""
-        end_idx = min(start_idx + search_window, len(data['lead_wrist_x']))
-        
-        if end_idx - start_idx < 6:
-            return None
-        
-        # Enhanced smoothing for hand tracking
-        smoothing_sigma = 1.2
-        lead_x_smooth = gaussian_filter1d(data['lead_wrist_x'][start_idx:end_idx], sigma=smoothing_sigma)
-        lead_y_smooth = gaussian_filter1d(data['lead_wrist_y'][start_idx:end_idx], sigma=smoothing_sigma)
-        back_x_smooth = gaussian_filter1d(data['back_wrist_x'][start_idx:end_idx], sigma=smoothing_sigma)
-        back_y_smooth = gaussian_filter1d(data['back_wrist_y'][start_idx:end_idx], sigma=smoothing_sigma)
-        
-        for i in range(3, len(lead_x_smooth) - 3):
-            # Calculate velocities for both hands
-            lead_vel_x = (lead_x_smooth[i+2] - lead_x_smooth[i-2]) / 4
-            lead_vel_y = (lead_y_smooth[i+2] - lead_y_smooth[i-2]) / 4
-            back_vel_x = (back_x_smooth[i+2] - back_x_smooth[i-2]) / 4
-            back_vel_y = (back_y_smooth[i+2] - back_y_smooth[i-2]) / 4
-            
-            lead_speed = np.sqrt(lead_vel_x**2 + lead_vel_y**2)
-            back_speed = np.sqrt(back_vel_x**2 + back_vel_y**2)
-            
-            # Calculate accelerations
-            if i >= 4:
-                prev_lead_vel_x = (lead_x_smooth[i] - lead_x_smooth[i-4]) / 4
-                prev_lead_vel_y = (lead_y_smooth[i] - lead_y_smooth[i-4]) / 4
-                prev_lead_speed = np.sqrt(prev_lead_vel_x**2 + prev_lead_vel_y**2)
-                
-                lead_acceleration = lead_speed - prev_lead_speed
-                
-                # Swing start: significant acceleration in both hands
-                if lead_speed > 0.06 and back_speed > 0.04 and lead_acceleration > 0.02:
-                    return data['frames'][start_idx + i]
-        
-        return None
-    
-    def _detect_shoulder_sequence_start_adaptive(self, data, start_idx, search_window):
-        """Adaptive shoulder sequence detection."""
-        end_idx = min(start_idx + search_window, len(data['back_shoulder_x']))
-        
-        if end_idx - start_idx < 6:
-            return None
-        
-        # Track back shoulder movement (key swing initiator)
-        back_shoulder_x = gaussian_filter1d(data['back_shoulder_x'][start_idx:end_idx], sigma=1.0)
-        
-        # Also track lead shoulder for sequence timing
-        lead_shoulder_x = gaussian_filter1d(data['lead_shoulder_x'][start_idx:end_idx], sigma=1.0)
-        
-        for i in range(3, len(back_shoulder_x) - 3):
-            # Back shoulder velocity (forward movement)
-            back_shoulder_vel = (back_shoulder_x[i+3] - back_shoulder_x[i-3]) / 6
-            
-            # Lead shoulder velocity (should be less initially)
-            lead_shoulder_vel = (lead_shoulder_x[i+3] - lead_shoulder_x[i-3]) / 6
-            
-            # Shoulder separation rate
-            separation_rate = abs(back_shoulder_vel - lead_shoulder_vel)
-            
-            # Shoulder sequence: back shoulder initiates with lead shoulder following
-            if abs(back_shoulder_vel) > 0.035 and separation_rate > 0.025:
-                return data['frames'][start_idx + i]
-        
-        return None
-    
-    def _detect_weight_transfer_start_adaptive(self, data, start_idx, search_window):
-        """Adaptive weight transfer detection."""
-        end_idx = min(start_idx + search_window, len(data['back_knee_x']))
-        
-        if end_idx - start_idx < 6:
-            return None
-        
-        # Track knee and hip positions for weight transfer
-        lead_knee_x = gaussian_filter1d(data['lead_knee_x'][start_idx:end_idx], sigma=1.0)
-        back_knee_x = gaussian_filter1d(data['back_knee_x'][start_idx:end_idx], sigma=1.0)
-        lead_hip_x = gaussian_filter1d(data['lead_hip_x'][start_idx:end_idx], sigma=1.0)
-        back_hip_x = gaussian_filter1d(data['back_hip_x'][start_idx:end_idx], sigma=1.0)
-        
-        for i in range(3, len(lead_knee_x) - 3):
-            # Calculate weight shift indicators
-            knee_separation = abs(lead_knee_x[i] - back_knee_x[i])
-            hip_separation = abs(lead_hip_x[i] - back_hip_x[i])
-            
-            # Rate of change in separations
-            if i >= 4:
-                prev_knee_sep = abs(lead_knee_x[i-4] - back_knee_x[i-4])
-                prev_hip_sep = abs(lead_hip_x[i-4] - back_hip_x[i-4])
-                
-                knee_sep_rate = abs(knee_separation - prev_knee_sep)
-                hip_sep_rate = abs(hip_separation - prev_hip_sep)
-                
-                # Weight transfer: changing separation patterns
-                if knee_sep_rate > 0.025 or hip_sep_rate > 0.02:
-                    return data['frames'][start_idx + i]
-        
-        return None
-    
-    def _detect_kinetic_chain_start_adaptive(self, data, start_idx, search_window):
-        """Detect start of kinetic chain sequence (hips->shoulders->arms)."""
-        end_idx = min(start_idx + search_window, len(data['lead_hip_x']))
-        
-        if end_idx - start_idx < 8:
-            return None
-        
-        # Calculate center of mass movement (simplified)
-        com_x = []
-        com_y = []
-        
-        for i in range(start_idx, end_idx):
-            # Weighted center of mass approximation
-            com_x_frame = (data['lead_hip_x'][i] + data['back_hip_x'][i] + 
-                          data['lead_shoulder_x'][i] + data['back_shoulder_x'][i]) / 4
-            com_y_frame = (data['lead_hip_y'][i] + data['back_hip_y'][i] +
-                          data['lead_shoulder_y'][i] + data['back_shoulder_y'][i]) / 4
-            com_x.append(com_x_frame)
-            com_y.append(com_y_frame)
-        
-        com_x_smooth = gaussian_filter1d(com_x, sigma=1.0)
-        
-        # Look for center of mass acceleration (kinetic chain initiation)
-        for i in range(3, len(com_x_smooth) - 3):
-            com_velocity = (com_x_smooth[i+2] - com_x_smooth[i-2]) / 4
-            
-            if i >= 4:
-                prev_com_velocity = (com_x_smooth[i] - com_x_smooth[i-4]) / 4
-                com_acceleration = com_velocity - prev_com_velocity
-                
-                # Kinetic chain starts with center of mass acceleration
-                if abs(com_acceleration) > 0.015 and abs(com_velocity) > 0.02:
-                    return data['frames'][start_idx + i]
-        
-        return None
-    
-    def _detect_contact_adaptive(self, data, swing_start, video_length):
-        """Enhanced contact detection using multiple adaptive indicators."""
+    def _detect_contact_adaptive(self, data, swing_start, video_length, handedness: str):
+        """Contact ≈ frame within ~N seconds after swing_start where the lead arm is close to fully straight.
+        Priority: earliest frame where hands are ahead of face (given handedness) AND extension ≥ near_thresh.
+        Fallbacks: closest-to-full among near-full frames; else max extension in window.
+        """
         if swing_start is None:
+            print("❌ _detect_contact_adaptive: swing_start is None")
             return None
-        
-        # Find swing start index
+
+        # --- locate swing_start index in data["frames"] ---
         start_idx = 0
         for i, frame in enumerate(data['frames']):
             if frame >= swing_start:
                 start_idx = i
                 break
-        
-        search_window = min(len(data['lead_wrist_x']) - start_idx - 3,
-                           max(12, video_length // 4))
-        
-        if search_window < 8:
+
+        # --- fixed window after swing start (assume 30 fps) ---
+        WINDOW_SECONDS = 4.0
+        fps_est = 30.0
+        window_frames = int(round(fps_est * WINDOW_SECONDS))
+        end_idx = min(start_idx + window_frames, len(data['lead_wrist_x']) - 1)
+        print(
+            f"🔎 contact: swing_start={swing_start}, start_idx={start_idx}, "
+            f"fps_assumed={fps_est:.1f}, window_seconds={WINDOW_SECONDS}, "
+            f"window_frames={window_frames}, end_idx={end_idx}"
+        )
+
+        if end_idx - start_idx < 6:
+            print("🚫 contact: too few frames in window after swing_start")
             return None
-        
-        # Multiple contact indicators with adaptive weights
-        contact_indicators = []
-        
-        # Indicator 1: Maximum hand separation (classic method, enhanced)
-        max_sep_frame = self._find_maximum_hand_separation_adaptive(data, start_idx, search_window)
-        if max_sep_frame:
-            contact_indicators.append(("max_separation", max_sep_frame, 3))
-        
-        # Indicator 2: Peak bat speed
-        max_speed_frame = self._find_maximum_bat_speed_adaptive(data, start_idx, search_window)
-        if max_speed_frame:
-            contact_indicators.append(("max_speed", max_speed_frame, 3))
-        
-        # Indicator 3: Lead arm extension peak
-        extension_frame = self._find_lead_arm_extension_max_adaptive(data, start_idx, search_window)
-        if extension_frame:
-            contact_indicators.append(("arm_extension", extension_frame, 2))
-        
-        # Indicator 4: Hip-shoulder sequence peak
-        sequence_frame = self._find_kinetic_sequence_peak_adaptive(data, start_idx, search_window)
-        if sequence_frame:
-            contact_indicators.append(("sequence_peak", sequence_frame, 2))
-        
-        # Indicator 5: Weight transfer completion
-        weight_completion_frame = self._find_weight_transfer_completion_adaptive(data, start_idx, search_window)
-        if weight_completion_frame:
-            contact_indicators.append(("weight_completion", weight_completion_frame, 1))
-        
-        if not contact_indicators:
+
+        # --- smoothing helper ---
+        def _smooth1d(x, sigma):
+            x = np.asarray(x, float)
+            if sigma and sigma > 0:
+                n = len(x); idx = np.arange(n); m = np.isfinite(x)
+                if n and (not m.all()) and m.any():
+                    x = x.copy(); x[~m] = np.interp(idx[~m], idx[m], x[m])
+                x = gaussian_filter1d(x, sigma=sigma)
+            return x
+
+        # ---------- series (smoothed) ----------
+        lsx = _smooth1d(data['lead_shoulder_x'], 0.8)
+        lsy = _smooth1d(data['lead_shoulder_y'], 0.8)
+        lex = _smooth1d(data['lead_elbow_x'],   0.8)
+        ley = _smooth1d(data['lead_elbow_y'],   0.8)
+        lwx = _smooth1d(data['lead_wrist_x'],   0.8)
+        lwy = _smooth1d(data['lead_wrist_y'],   0.8)
+
+        # lead arm extension & arm length estimate
+        upper_len = np.sqrt((lex - lsx)**2 + (ley - lsy)**2)
+        fore_len  = np.sqrt((lwx - lex)**2 + (lwy - ley)**2)
+        arm_len_est = np.median((upper_len[start_idx:end_idx] + fore_len[start_idx:end_idx]))
+        ext = np.sqrt((lwx - lsx)**2 + (lwy - lsy)**2)  # shoulder→wrist
+        ext_s = _smooth1d(ext, 0.8)
+
+        # baseline to avoid micro false-positives near swing start
+        lo, hi = start_idx, end_idx
+        pre_span = max(3, min(6, end_idx - start_idx))
+        baseline_ext = float(np.median(ext_s[start_idx:start_idx + pre_span]))
+        ext_seg = ext_s[lo:hi+1]
+        if ext_seg.size == 0:
+            print("🚫 contact: empty ext_seg slice")
             return None
-        
-        # Weighted consensus with temporal clustering
-        frame_weights = {}
-        for indicator_name, frame, weight in contact_indicators:
-            for check_frame in range(frame - 3, frame + 4):
-                if check_frame not in frame_weights:
-                    frame_weights[check_frame] = 0
-                # Distance-weighted scoring
-                distance_weight = (4 - abs(check_frame - frame)) / 4
-                frame_weights[check_frame] += weight * distance_weight
-        
-        if frame_weights:
-            best_frame = max(frame_weights.items(), key=lambda x: x[1])
-            if best_frame[1] >= 5:  # Minimum weighted evidence threshold
-                return best_frame[0]
-        
-        # Fallback to highest confidence single indicator
-        high_confidence = [(name, frame) for name, frame, weight in contact_indicators if weight >= 3]
-        if high_confidence:
-            return min(frame for _, frame in high_confidence)
-        
-        return None
+
+        # thresholds for "near full" candidate
+        NEAR_RATIO = 0.92
+        MIN_GAIN   = 0.03
+        if not np.isfinite(arm_len_est) or arm_len_est <= 0:
+            near_thresh = baseline_ext + MIN_GAIN
+        else:
+            near_thresh = max(NEAR_RATIO * arm_len_est, baseline_ext + MIN_GAIN)
+
+        # ---------- FACE CHECK: hands ahead of face given handedness ----------
+        hx = 0.5 * (np.asarray(data['lead_wrist_x'], float) + np.asarray(data['back_wrist_x'], float))
+        hx_s = _smooth1d(hx, 0.6)
+        face_x = np.asarray(data.get('face_center_x', []), float)
+        have_face = (len(face_x) == len(hx_s))
+        face_x_s = _smooth1d(face_x, 0.8) if have_face else face_x
+
+        sign = +1.0 if handedness == 'right' else (-1.0 if handedness == 'left' else None)
+        margin = 0.01  # tiny buffer in normalized units
+
+        if not have_face:
+            print("⚠️ face-gate: face_center_x not available or misaligned; skipping face check")
+        elif sign is None:
+            print("⚠️ face-gate: handedness unknown; skipping face check")
+        else:
+            fin = np.isfinite(face_x_s[lo:hi+1]).sum()
+            print(
+                f"🧠 face-gate: have_face=True, handedness={handedness}, "
+                f"finite_face_in_window={fin}/{(hi-lo+1)}"
+            )
+
+        def hands_ahead(idx: int) -> bool:
+            if not (have_face and sign is not None):
+                return False
+            if not (np.isfinite(hx_s[idx]) and np.isfinite(face_x_s[idx])):
+                return False
+            diff = sign * (hx_s[idx] - face_x_s[idx])
+            return diff >= margin
+
+        # --- DEBUG: Per-frame extension and face-check info ---
+        print("\n🛠 DEBUG: Frame-by-frame contact search window")
+        print(" idx | frame | ext_len  | ratio_to_full | near_thresh? | hands_ahead?")
+        print("-----|-------|----------|---------------|--------------|--------------")
+        for idx in range(lo, hi + 1):
+            frame_num = int(data['frames'][idx])
+            ext_len = ext_s[idx]
+            ratio = (ext_len / arm_len_est) if (arm_len_est and np.isfinite(arm_len_est) and arm_len_est != 0) else float('nan')
+            near_full = bool(np.isfinite(ext_len) and ext_len >= near_thresh)
+            ahead = hands_ahead(idx)
+            print(f"{idx:4d} | {frame_num:5d} | {ext_len:8.4f} | "
+                f"{ratio:>13.3f} | {str(near_full):>12} | {str(ahead):>12}")
+
+        print(
+            f"📏 arm_len_est={arm_len_est:.4f}, baseline_ext={baseline_ext:.4f}, "
+            f"near_thresh={near_thresh:.4f} (ratio={NEAR_RATIO}, min_gain={MIN_GAIN})"
+        )
+        print(
+            f"   ext in window: min={np.nanmin(ext_seg):.4f}, max={np.nanmax(ext_seg):.4f}, "
+            f"@frame={int(data['frames'][lo + int(np.nanargmax(ext_seg))])}"
+        )
+
+        # =========================
+        # SELECTION LOGIC (updated)
+        # =========================
+
+        # STEP 1: Earliest frame with hands ahead AND near-full extension
+        earliest_ahead_idx = None
+        for idx in range(lo, hi + 1):
+            if np.isfinite(ext_s[idx]) and ext_s[idx] >= near_thresh and hands_ahead(idx):
+                earliest_ahead_idx = idx
+                break
+
+        if earliest_ahead_idx is not None:
+            k = earliest_ahead_idx
+            print(
+                f"🎯 contact: earliest ahead-of-face & near-full at idx={k} "
+                f"(frame={int(data['frames'][k])}), ext={ext_s[k]:.4f}"
+            )
+            return int(data['frames'][k])
+
+        # STEP 2: Fallback — closest-to-full among near-full frames
+        cand_mask = np.isfinite(ext_seg) & (ext_seg >= near_thresh)
+        if np.any(cand_mask):
+            cand_idxs_rel = np.where(cand_mask)[0]
+            cand_idxs_abs = [lo + r for r in cand_idxs_rel]
+            k = min(cand_idxs_abs, key=lambda i: abs(ext_s[i] - arm_len_est))
+            print(
+                f"ℹ️ no ahead-of-face near-full; using closest-to-full idx={k} "
+                f"(frame={int(data['frames'][k])}), ext={ext_s[k]:.4f}"
+            )
+        else:
+            # STEP 3: Fallback — max extension in window
+            rel_k = int(np.nanargmax(ext_seg))
+            k = lo + rel_k
+            print(
+                f"ℹ️ no near-full candidates; using max extension idx={k} "
+                f"(frame={int(data['frames'][k])}), ext={ext_s[k]:.4f}"
+            )
+
+        # Optional nudge for fallback pick: look ahead a few frames to see if hands become ahead
+        if have_face and sign is not None:
+            nudged = None
+            for t in range(k + 1, min(k + 6, end_idx + 1)):
+                ahead = hands_ahead(t)
+                close_enough = bool(np.isfinite(ext_s[t]) and ext_s[t] >= near_thresh)
+                hv, fv = hx_s[t], face_x_s[t]
+                diff_t = sign * (hv - fv) if (np.isfinite(hv) and np.isfinite(fv)) else np.nan
+                print(
+                    f"   ↪️ try t={t} (frame={int(data['frames'][t])}): "
+                    f"ext={ext_s[t]:.4f} ({(ext_s[t]/arm_len_est if arm_len_est else float('nan')):.3f}×arm), "
+                    f"close_enough={close_enough}, "
+                    f"hx={hv:.4f} fx={fv:.4f} sign*Δ={diff_t if np.isfinite(diff_t) else float('nan'):.4f} "
+                    f"ahead={ahead}"
+                )
+                if close_enough and ahead:
+                    nudged = t
+                    break
+
+            if nudged is not None:
+                print(
+                    f"🎯 contact: nudged to idx={nudged} (frame={int(data['frames'][nudged])}) — returning"
+                )
+                return int(data['frames'][nudged])
+
+        # Final return (fallback candidate)
+        print(
+            f"✅ contact: returning idx={k} (frame={int(data['frames'][k])}); "
+            f"no earlier ahead-of-face near-full found"
+        )
+        return int(data['frames'][k])
+
+
     
     def _find_maximum_hand_separation_adaptive(self, data, start_idx, search_window):
         """Enhanced maximum hand separation detection."""
