@@ -570,31 +570,20 @@ class RobustBaseballSwingAnalyzer:
         return None
     
     def _detect_contact_adaptive(self, data, swing_start, video_length, handedness: str):
-        """Contact ≈ frame within ~N seconds after swing_start where the lead arm is close to fully straight.
-        Priority: earliest frame where hands are ahead of face (given handedness) AND extension ≥ near_thresh.
-        Fallbacks: closest-to-full among near-full frames; else max extension in window.
-        """
+        """Contact detection using elbow angle instead of arm length."""
+
         if swing_start is None:
             print("❌ _detect_contact_adaptive: swing_start is None")
             return None
 
-        # --- locate swing_start index in data["frames"] ---
-        start_idx = 0
-        for i, frame in enumerate(data['frames']):
-            if frame >= swing_start:
-                start_idx = i
-                break
+        # --- locate swing_start index ---
+        start_idx = next((i for i, f in enumerate(data['frames']) if f >= swing_start), 0)
 
-        # --- fixed window after swing start (assume 30 fps) ---
+        # --- fixed window after swing start ---
         WINDOW_SECONDS = 4.0
         fps_est = 30.0
         window_frames = int(round(fps_est * WINDOW_SECONDS))
         end_idx = min(start_idx + window_frames, len(data['lead_wrist_x']) - 1)
-        print(
-            f"🔎 contact: swing_start={swing_start}, start_idx={start_idx}, "
-            f"fps_assumed={fps_est:.1f}, window_seconds={WINDOW_SECONDS}, "
-            f"window_frames={window_frames}, end_idx={end_idx}"
-        )
 
         if end_idx - start_idx < 6:
             print("🚫 contact: too few frames in window after swing_start")
@@ -604,13 +593,16 @@ class RobustBaseballSwingAnalyzer:
         def _smooth1d(x, sigma):
             x = np.asarray(x, float)
             if sigma and sigma > 0:
-                n = len(x); idx = np.arange(n); m = np.isfinite(x)
+                n = len(x)
+                idx = np.arange(n)
+                m = np.isfinite(x)
                 if n and (not m.all()) and m.any():
-                    x = x.copy(); x[~m] = np.interp(idx[~m], idx[m], x[m])
+                    x = x.copy()
+                    x[~m] = np.interp(idx[~m], idx[m], x[m])
                 x = gaussian_filter1d(x, sigma=sigma)
             return x
 
-        # ---------- series (smoothed) ----------
+        # Smooth coordinates
         lsx = _smooth1d(data['lead_shoulder_x'], 0.8)
         lsy = _smooth1d(data['lead_shoulder_y'], 0.8)
         lex = _smooth1d(data['lead_elbow_x'],   0.8)
@@ -618,50 +610,33 @@ class RobustBaseballSwingAnalyzer:
         lwx = _smooth1d(data['lead_wrist_x'],   0.8)
         lwy = _smooth1d(data['lead_wrist_y'],   0.8)
 
-        # lead arm extension & arm length estimate
-        upper_len = np.sqrt((lex - lsx)**2 + (ley - lsy)**2)
-        fore_len  = np.sqrt((lwx - lex)**2 + (lwy - ley)**2)
-        arm_len_est = np.median((upper_len[start_idx:end_idx] + fore_len[start_idx:end_idx]))
-        ext = np.sqrt((lwx - lsx)**2 + (lwy - lsy)**2)  # shoulder→wrist
-        ext_s = _smooth1d(ext, 0.8)
+        # === Elbow angle calculation ===
+        def elbow_angle_deg(sx, sy, ex, ey, wx, wy):
+            SE = np.sqrt((sx - ex)**2 + (sy - ey)**2)
+            EW = np.sqrt((ex - wx)**2 + (ey - wy)**2)
+            SW = np.sqrt((sx - wx)**2 + (sy - wy)**2)
+            if SE == 0 or EW == 0:
+                return np.nan
+            cos_theta = (SE**2 + EW**2 - SW**2) / (2 * SE * EW)
+            cos_theta = np.clip(cos_theta, -1.0, 1.0)
+            return np.degrees(np.arccos(cos_theta))
 
-        # baseline to avoid micro false-positives near swing start
-        lo, hi = start_idx, end_idx
-        pre_span = max(3, min(6, end_idx - start_idx))
-        baseline_ext = float(np.median(ext_s[start_idx:start_idx + pre_span]))
-        ext_seg = ext_s[lo:hi+1]
-        if ext_seg.size == 0:
-            print("🚫 contact: empty ext_seg slice")
-            return None
+        elbow_angles = np.array([
+            elbow_angle_deg(lsx[i], lsy[i], lex[i], ley[i], lwx[i], lwy[i])
+            for i in range(len(lsx))
+        ])
 
-        # thresholds for "near full" candidate
-        NEAR_RATIO = 0.92
-        MIN_GAIN   = 0.03
-        if not np.isfinite(arm_len_est) or arm_len_est <= 0:
-            near_thresh = baseline_ext + MIN_GAIN
-        else:
-            near_thresh = max(NEAR_RATIO * arm_len_est, baseline_ext + MIN_GAIN)
+        # Threshold for "almost straight" arm
+        ANGLE_THRESH = 160.0
 
-        # ---------- FACE CHECK: hands ahead of face given handedness ----------
+        # Hands-ahead-of-face check
         hx = 0.5 * (np.asarray(data['lead_wrist_x'], float) + np.asarray(data['back_wrist_x'], float))
         hx_s = _smooth1d(hx, 0.6)
         face_x = np.asarray(data.get('face_center_x', []), float)
         have_face = (len(face_x) == len(hx_s))
         face_x_s = _smooth1d(face_x, 0.8) if have_face else face_x
-
         sign = +1.0 if handedness == 'right' else (-1.0 if handedness == 'left' else None)
-        margin = 0.01  # tiny buffer in normalized units
-
-        if not have_face:
-            print("⚠️ face-gate: face_center_x not available or misaligned; skipping face check")
-        elif sign is None:
-            print("⚠️ face-gate: handedness unknown; skipping face check")
-        else:
-            fin = np.isfinite(face_x_s[lo:hi+1]).sum()
-            print(
-                f"🧠 face-gate: have_face=True, handedness={handedness}, "
-                f"finite_face_in_window={fin}/{(hi-lo+1)}"
-            )
+        margin = 0.01
 
         def hands_ahead(idx: int) -> bool:
             if not (have_face and sign is not None):
@@ -671,97 +646,41 @@ class RobustBaseballSwingAnalyzer:
             diff = sign * (hx_s[idx] - face_x_s[idx])
             return diff >= margin
 
-        # --- DEBUG: Per-frame extension and face-check info ---
+        # --- DEBUG print ---
         print("\n🛠 DEBUG: Frame-by-frame contact search window")
-        print(" idx | frame | ext_len  | ratio_to_full | near_thresh? | hands_ahead?")
-        print("-----|-------|----------|---------------|--------------|--------------")
-        for idx in range(lo, hi + 1):
-            frame_num = int(data['frames'][idx])
-            ext_len = ext_s[idx]
-            ratio = (ext_len / arm_len_est) if (arm_len_est and np.isfinite(arm_len_est) and arm_len_est != 0) else float('nan')
-            near_full = bool(np.isfinite(ext_len) and ext_len >= near_thresh)
+        print(" idx | frame | elbow_angle | near_full? | hands_ahead?")
+        print("-----|-------|-------------|------------|--------------")
+        for idx in range(start_idx, end_idx + 1):
+            angle = elbow_angles[idx]
+            nf = np.isfinite(angle) and angle >= ANGLE_THRESH
             ahead = hands_ahead(idx)
-            print(f"{idx:4d} | {frame_num:5d} | {ext_len:8.4f} | "
-                f"{ratio:>13.3f} | {str(near_full):>12} | {str(ahead):>12}")
+            print(f"{idx:4d} | {int(data['frames'][idx]):5d} | {angle:11.2f} | {str(nf):>10} | {str(ahead):>12}")
 
-        print(
-            f"📏 arm_len_est={arm_len_est:.4f}, baseline_ext={baseline_ext:.4f}, "
-            f"near_thresh={near_thresh:.4f} (ratio={NEAR_RATIO}, min_gain={MIN_GAIN})"
-        )
-        print(
-            f"   ext in window: min={np.nanmin(ext_seg):.4f}, max={np.nanmax(ext_seg):.4f}, "
-            f"@frame={int(data['frames'][lo + int(np.nanargmax(ext_seg))])}"
-        )
-
-        # =========================
-        # SELECTION LOGIC (updated)
-        # =========================
-
-        # STEP 1: Earliest frame with hands ahead AND near-full extension
-        earliest_ahead_idx = None
-        for idx in range(lo, hi + 1):
-            if np.isfinite(ext_s[idx]) and ext_s[idx] >= near_thresh and hands_ahead(idx):
-                earliest_ahead_idx = idx
+        # === Selection logic ===
+        # Step 1: earliest frame with straight arm & hands ahead
+        earliest_idx = None
+        for idx in range(start_idx, end_idx + 1):
+            if np.isfinite(elbow_angles[idx]) and elbow_angles[idx] >= ANGLE_THRESH and hands_ahead(idx):
+                earliest_idx = idx
                 break
 
-        if earliest_ahead_idx is not None:
-            k = earliest_ahead_idx
-            print(
-                f"🎯 contact: earliest ahead-of-face & near-full at idx={k} "
-                f"(frame={int(data['frames'][k])}), ext={ext_s[k]:.4f}"
-            )
+        if earliest_idx is not None:
+            print(f"🎯 contact: earliest straight-arm & ahead-of-face at idx={earliest_idx} "
+                f"(frame={int(data['frames'][earliest_idx])}, angle={elbow_angles[earliest_idx]:.2f}°)")
+            return int(data['frames'][earliest_idx])
+
+        # Step 2: fallback to straightest arm
+        valid_idxs = [i for i in range(start_idx, end_idx + 1) if np.isfinite(elbow_angles[i])]
+        if valid_idxs:
+            k = max(valid_idxs, key=lambda i: elbow_angles[i])
+            print(f"ℹ️ no ahead-of-face match; using straightest arm idx={k} "
+                f"(frame={int(data['frames'][k])}, angle={elbow_angles[k]:.2f}°)")
             return int(data['frames'][k])
 
-        # STEP 2: Fallback — closest-to-full among near-full frames
-        cand_mask = np.isfinite(ext_seg) & (ext_seg >= near_thresh)
-        if np.any(cand_mask):
-            cand_idxs_rel = np.where(cand_mask)[0]
-            cand_idxs_abs = [lo + r for r in cand_idxs_rel]
-            k = min(cand_idxs_abs, key=lambda i: abs(ext_s[i] - arm_len_est))
-            print(
-                f"ℹ️ no ahead-of-face near-full; using closest-to-full idx={k} "
-                f"(frame={int(data['frames'][k])}), ext={ext_s[k]:.4f}"
-            )
-        else:
-            # STEP 3: Fallback — max extension in window
-            rel_k = int(np.nanargmax(ext_seg))
-            k = lo + rel_k
-            print(
-                f"ℹ️ no near-full candidates; using max extension idx={k} "
-                f"(frame={int(data['frames'][k])}), ext={ext_s[k]:.4f}"
-            )
+        print("🚫 No valid elbow angles for contact detection")
+        return None
 
-        # Optional nudge for fallback pick: look ahead a few frames to see if hands become ahead
-        if have_face and sign is not None:
-            nudged = None
-            for t in range(k + 1, min(k + 6, end_idx + 1)):
-                ahead = hands_ahead(t)
-                close_enough = bool(np.isfinite(ext_s[t]) and ext_s[t] >= near_thresh)
-                hv, fv = hx_s[t], face_x_s[t]
-                diff_t = sign * (hv - fv) if (np.isfinite(hv) and np.isfinite(fv)) else np.nan
-                print(
-                    f"   ↪️ try t={t} (frame={int(data['frames'][t])}): "
-                    f"ext={ext_s[t]:.4f} ({(ext_s[t]/arm_len_est if arm_len_est else float('nan')):.3f}×arm), "
-                    f"close_enough={close_enough}, "
-                    f"hx={hv:.4f} fx={fv:.4f} sign*Δ={diff_t if np.isfinite(diff_t) else float('nan'):.4f} "
-                    f"ahead={ahead}"
-                )
-                if close_enough and ahead:
-                    nudged = t
-                    break
 
-            if nudged is not None:
-                print(
-                    f"🎯 contact: nudged to idx={nudged} (frame={int(data['frames'][nudged])}) — returning"
-                )
-                return int(data['frames'][nudged])
-
-        # Final return (fallback candidate)
-        print(
-            f"✅ contact: returning idx={k} (frame={int(data['frames'][k])}); "
-            f"no earlier ahead-of-face near-full found"
-        )
-        return int(data['frames'][k])
 
 
     
@@ -1173,7 +1092,53 @@ async def analyze_video_from_url(url: str):
         video_path = tmp.name
 
 
+    # --- Check and fix rotation ---
+    # Get rotation metadata
+    probe = ffmpeg.probe(video_path)
+    rotation = 0
+
+    for stream in probe['streams']:
+        # Some phones (esp. iPhones) put it in 'tags', others in 'side_data_list'
+        if 'tags' in stream and 'rotate' in stream['tags']:
+            rotation = int(stream['tags']['rotate'])
+            break
+        if 'side_data_list' in stream:
+            for item in stream['side_data_list']:
+                if 'rotation' in item:
+                    rotation = int(item['rotation'])
+                    break
+
+    if rotation != 0:
+        print(f"📐 Detected rotation metadata: {rotation}° — correcting...")
+        fixed_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+        transpose_map = {90: 1, 180: 2, 270: 3}
+
+        if rotation % 360 in transpose_map:
+            (
+                ffmpeg
+                .input(video_path)
+                .filter('transpose', transpose_map[rotation % 360])
+                .output(fixed_path, vcodec='libx264', acodec='aac', strict='experimental')
+                .run(quiet=True, overwrite_output=True)
+            )
+        else:
+            # 180° special case
+            (
+                ffmpeg
+                .input(video_path)
+                .vf("transpose=2,transpose=2")
+                .output(fixed_path, vcodec='libx264', acodec='aac', strict='experimental')
+                .run(quiet=True, overwrite_output=True)
+            )
+
+        os.remove(video_path)
+        video_path = fixed_path
+    else:
+        print("📐 No rotation metadata found — no correction needed.")
+
+    # Now open the corrected file
     cap = cv2.VideoCapture(video_path)
+
     if not cap.isOpened():
         return [{"message": "Failed to read video file"}], {}
 
