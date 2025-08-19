@@ -10,6 +10,10 @@ from scipy.signal import savgol_filter
 import json
 from typing import Dict, List, Tuple, Optional
 import ffmpeg
+import uuid
+
+# NEW: supabase-py client
+from supabase import create_client, Client
 
 
 mp_pose = mp.solutions.pose
@@ -471,7 +475,8 @@ class RobustBaseballSwingAnalyzer:
                 best_score = score
                 best_frame = data['frames'][i]
 
-            print(f"🧪 Frame {data['frames'][i]}: local_min={is_local_min}, converged_nearby={feet_converged_nearby}, score={score}")
+
+            #print(f"🧪 Frame {data['frames'][i]}: local_min={is_local_min}, converged_nearby={feet_converged_nearby}, score={score}")
 
         print("⚠️ No perfect foot plant frame found. Best guess:")
 
@@ -647,6 +652,7 @@ class RobustBaseballSwingAnalyzer:
             return diff >= margin
 
         # --- DEBUG print ---
+        """
         print("\n🛠 DEBUG: Frame-by-frame contact search window")
         print(" idx | frame | elbow_angle | near_full? | hands_ahead?")
         print("-----|-------|-------------|------------|--------------")
@@ -655,6 +661,7 @@ class RobustBaseballSwingAnalyzer:
             nf = np.isfinite(angle) and angle >= ANGLE_THRESH
             ahead = hands_ahead(idx)
             print(f"{idx:4d} | {int(data['frames'][idx]):5d} | {angle:11.2f} | {str(nf):>10} | {str(ahead):>12}")
+        """
 
         # === Selection logic ===
         # Step 1: earliest frame with straight arm & hands ahead
@@ -1071,150 +1078,194 @@ class RobustBaseballSwingAnalyzer:
             }
 
 
-# Keep the same video loading functions as the original
+# ---------------- Rotation fix ----------------
+
+def fix_rotation_if_needed(input_path: str) -> tuple[str, bool, int]:
+    """
+    Uses ffprobe to read rotation metadata and, if needed, writes an upright copy
+    to a new temp file and returns (path, was_rotated, rotation_deg).
+    If no rotation needed, returns (input_path, False, 0).
+    """
+    # 1) Probe rotation metadata
+    try:
+        probe = ffmpeg.probe(input_path)
+    except Exception as e:
+        print(f"⚠️ ffprobe failed, skipping rotation fix: {e}")
+        return input_path, False, 0
+
+    vstreams = [s for s in probe.get("streams", []) if s.get("codec_type") == "video"]
+    if not vstreams:
+        print("⚠️ No video streams found by ffprobe; skipping rotation fix.")
+        return input_path, False, 0
+    st = vstreams[0]
+
+    rotation = 0
+    src = "none"
+    rot_tag = (st.get("tags") or {}).get("rotate")
+    if rot_tag is not None:
+        try:
+            rotation = int(rot_tag) % 360
+            src = "tags.rotate"
+        except:
+            pass
+    if rotation == 0:
+        for sd in (st.get("side_data_list") or []):
+            if sd.get("side_data_type") == "Display Matrix" and sd.get("rotation") is not None:
+                try:
+                    rotation = int(sd["rotation"]) % 360
+                    src = "side_data_list.Display Matrix"
+                    break
+                except:
+                    pass
+
+    print(f"🔎 ffprobe rotation: {rotation}° (source: {src})")
+
+    if rotation == 0:
+        print("📐 No rotation needed.")
+        return input_path, False, 0
+
+    # 2) Physically rotate frames with OpenCV (no metadata involved)
+    cap = cv2.VideoCapture(input_path)
+    if not cap.isOpened():
+        print("⚠️ OpenCV failed to open input; skipping rotation.")
+        return input_path, False, rotation
+
+    in_w  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    in_h  = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    fps   = cap.get(cv2.CAP_PROP_FPS) or 30.0
+
+    # FIXED: Correct output dimensions based on rotation
+    if rotation in (90, 270):
+        out_size = (in_h, in_w)  # swap dimensions for 90/270 degree rotations
+    else:
+        out_size = (in_w, in_h)  # keep same for 180 degree
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    out_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+    out = cv2.VideoWriter(out_path, fourcc, fps, out_size)
+
+    # FIXED: Correct rotation mapping
+    # Metadata rotation describes how the video SHOULD be rotated to appear upright
+    # We need to apply the OPPOSITE rotation to make it upright
+    if rotation == 90:
+        # Video was recorded rotated 90° CW, so rotate 90° CCW to fix it
+        rot_code = cv2.ROTATE_90_COUNTERCLOCKWISE
+    elif rotation == 270:
+        # Video was recorded rotated 90° CCW, so rotate 90° CW to fix it  
+        rot_code = cv2.ROTATE_90_CLOCKWISE
+    elif rotation == 180:
+        rot_code = None  # handled separately with flip
+    else:
+        print(f"⚠️ Unsupported rotation {rotation}°; using original.")
+        cap.release()
+        out.release()
+        try:
+            os.remove(out_path)
+        except:
+            pass
+        return input_path, False, rotation
+
+    frames = 0
+    print(f"🔄 Applying rotation correction: {rotation}° metadata -> {rot_code if rot_code else 'flip'}")
+    
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        # Apply the correction rotation
+        if rotation == 180:
+            frame = cv2.flip(frame, -1)  # 180° rotate via flip
+        else:
+            frame = cv2.rotate(frame, rot_code)
+            
+        out.write(frame)
+        frames += 1
+
+    cap.release()
+    out.release()
+
+    if frames == 0:
+        # If something went wrong, fall back to original
+        try:
+            os.remove(out_path)
+        except:
+            pass
+        print("⚠️ No frames written during rotation; using original.")
+        return input_path, False, rotation
+
+    print(f"✅ Wrote upright copy (pixel-rotated): {out_path} ({frames} frames)")
+    return out_path, True, rotation
+
+
+# ---------------- Analyzer entry (uploads rotated copy if present) ----------------
+
 async def analyze_video_from_url(url: str):
-    """
-    Main analysis function with enhanced robustness for different video characteristics.
-    """
     print(f"🔗 Downloading video from URL: {url}")
     feedback = []
     biomarker_results = {}
 
-    async with httpx.AsyncClient() as client:
-        response = await client.get(url)
-        if response.status_code != 200:
-            return [{"message": "Failed to download video"}], {}
+    # 1) Download original
+    original_path = await _download_temp(url)
 
-        video_bytes = response.content
+    # 2) Normalize rotation (always gives us an upright copy)
+    fixed_path, was_rotated, rotation_deg = fix_rotation_if_needed(original_path)
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
-        tmp.write(video_bytes)
-        video_path = tmp.name
-
-
-    # --- Check and fix rotation ---
-    # Get rotation metadata
-    probe = ffmpeg.probe(video_path)
-    rotation = 0
-
-    for stream in probe['streams']:
-        # Some phones (esp. iPhones) put it in 'tags', others in 'side_data_list'
-        if 'tags' in stream and 'rotate' in stream['tags']:
-            rotation = int(stream['tags']['rotate'])
-            break
-        if 'side_data_list' in stream:
-            for item in stream['side_data_list']:
-                if 'rotation' in item:
-                    rotation = int(item['rotation'])
-                    break
-
-    if rotation != 0:
-        print(f"📐 Detected rotation metadata: {rotation}° — correcting...")
-        fixed_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
-        transpose_map = {90: 1, 180: 2, 270: 3}
-
-        if rotation % 360 in transpose_map:
-            (
-                ffmpeg
-                .input(video_path)
-                .filter('transpose', transpose_map[rotation % 360])
-                .output(fixed_path, vcodec='libx264', acodec='aac', strict='experimental')
-                .run(quiet=True, overwrite_output=True)
-            )
-        else:
-            # 180° special case
-            (
-                ffmpeg
-                .input(video_path)
-                .vf("transpose=2,transpose=2")
-                .output(fixed_path, vcodec='libx264', acodec='aac', strict='experimental')
-                .run(quiet=True, overwrite_output=True)
-            )
-
-        os.remove(video_path)
-        video_path = fixed_path
-    else:
-        print("📐 No rotation metadata found — no correction needed.")
-
-    # Now open the corrected file
-    cap = cv2.VideoCapture(video_path)
-
+    # 3) Analyze *only the local upright copy*
+    cap = cv2.VideoCapture(fixed_path)
     if not cap.isOpened():
         return [{"message": "Failed to read video file"}], {}
 
-    # Initialize the enhanced analyzer
     analyzer = RobustBaseballSwingAnalyzer()
-    
-    frame_count = 0
+
     landmarks_over_time = []
-    
-    # Get video properties
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    duration = total_frames / fps if fps > 0 else 0
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    duration = (total_frames / fps) if fps > 0 else 0.0
+    print(f"📹 Processing from local upright copy: {fixed_path}")
+    print(f"📹 {total_frames} frames at {fps:.1f} FPS ({duration:.1f}s)")
 
-    print(f"📹 Processing video: {total_frames} frames at {fps:.1f} FPS ({duration:.1f}s)")
-
-    while cap.isOpened():
+    while True:
         ret, frame = cap.read()
         if not ret:
             break
-
         image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = analyzer.pose.process(image_rgb)
-
         if results.pose_landmarks:
             landmarks_over_time.append(results.pose_landmarks.landmark)
 
-        frame_count += 1
-
     cap.release()
-    os.remove(video_path)
 
     if len(landmarks_over_time) < 10:
-        return [{"message": "Insufficient pose detection. Ensure clear view of full body throughout the swing."}], {}
+        return ([{"message": "Insufficient pose detection. Ensure clear view of full body throughout the swing."}], {})
 
     print(f"🧠 Analyzing {len(landmarks_over_time)} frames with pose data...")
 
-    # Enhanced handedness detection
+    # ----- your existing analysis below -----
     handedness_result = analyzer.detect_handedness_fusion(landmarks_over_time)
     handedness = handedness_result["handedness"]
-    
-    print(f"🤚 Detected handedness: {handedness} (confidence: {handedness_result['confidence']:.2f})")
-    
-    # Print debug info for handedness detection
-    if "debug" in handedness_result:
-        print("   Handedness detection details:")
-        if isinstance(handedness_result.get("debug"), dict):
-            for method, details in handedness_result["debug"].items():
-                print(f"   - {method}: {details}")
-        else:
-            print(f"   Debug: {handedness_result['debug']}")
+    print(f"🤚 Detected handedness: {handedness} (confidence: {handedness_result.get('confidence', 0):.2f})")
 
-    
-    # Enhanced swing phase detection
     swing_phases = analyzer.detect_precise_swing_timing(landmarks_over_time, handedness)
 
-    # Log hip-shoulder separation at foot plant if available
     foot_plant_frame = swing_phases.get("foot_plant")
-    if foot_plant_frame is not None:
+    if foot_plant_frame is not None and 0 <= foot_plant_frame < len(landmarks_over_time):
         try:
             lm = landmarks_over_time[foot_plant_frame]
             if handedness == "left":
-                lead_shoulder = lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value]
-                back_shoulder = lm[mp_pose.PoseLandmark.LEFT_SHOULDER.value]
-                lead_hip = lm[mp_pose.PoseLandmark.RIGHT_HIP.value]
-                back_hip = lm[mp_pose.PoseLandmark.LEFT_HIP.value]
+                lead_shoulder = lm[mp.PoseLandmark.RIGHT_SHOULDER.value]
+                back_shoulder = lm[mp.PoseLandmark.LEFT_SHOULDER.value]
+                lead_hip = lm[mp.PoseLandmark.RIGHT_HIP.value]
+                back_hip = lm[mp.PoseLandmark.LEFT_HIP.value]
             else:
-                lead_shoulder = lm[mp_pose.PoseLandmark.LEFT_SHOULDER.value]
-                back_shoulder = lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value]
-                lead_hip = lm[mp_pose.PoseLandmark.LEFT_HIP.value]
-                back_hip = lm[mp_pose.PoseLandmark.RIGHT_HIP.value]
+                lead_shoulder = lm[mp.PoseLandmark.LEFT_SHOULDER.value]
+                back_shoulder = lm[mp.PoseLandmark.RIGHT_SHOULDER.value]
+                lead_hip = lm[mp.PoseLandmark.LEFT_HIP.value]
+                back_hip = lm[mp.PoseLandmark.RIGHT_HIP.value]
 
             hip_angle = np.degrees(np.arctan2(back_hip.y - lead_hip.y, back_hip.x - lead_hip.x))
             shoulder_angle = np.degrees(np.arctan2(back_shoulder.y - lead_shoulder.y, back_shoulder.x - lead_shoulder.x))
-            separation = abs(((shoulder_angle - hip_angle + 180) % 360) - 180)  # Normalize and take absolute value
-
+            separation = abs(((shoulder_angle - hip_angle + 180) % 360) - 180)
             print(f"📐 Separation at foot plant (Frame {foot_plant_frame}): {separation:.1f}°")
 
             if separation < 20 or separation > 40:
@@ -1225,39 +1276,29 @@ async def analyze_video_from_url(url: str):
                     "severity": "medium"
                 })
 
-
             torso_lean_result = analyzer.calculate_torso_lean_at_frame(landmarks_over_time[foot_plant_frame], handedness)
             angle = torso_lean_result.get("torso_lean_angle")
-            
             if angle is not None:
                 direction = "forward" if angle > 0 else "backward"
                 print(f"📏 Torso lean at foot plant (Frame {foot_plant_frame}): {angle:.1f}° ({direction})")
-            else:
-                print("⚠️ Could not calculate torso lean at foot plant.")
-
-        
         except Exception as e:
-            print(f"⚠️ Could not compute separation at foot plant: {e}")
+            print(f"⚠️ Could not compute separation/torso lean at foot plant: {e}")
 
-    
     print("⏱️ Swing phases detected:")
     for phase, frame in swing_phases.items():
         if frame is not None:
-            time_seconds = frame / fps if fps > 0 else frame * 0.033
-            print(f"   • {phase.replace('_', ' ').title()}: Frame {frame} ({time_seconds:.2f}s)")
+            t = frame / fps if fps and fps > 0 else frame * 0.033
+            print(f"   • {phase.replace('_',' ').title()}: Frame {frame} ({t:.2f}s)")
         else:
-            print(f"   • {phase.replace('_', ' ').title()}: Not detected")
+            print(f"   • {phase.replace('_',' ').title()}: Not detected")
 
-    # Enhanced hip-shoulder separation analysis
     separation_analysis = analyzer.calculate_hip_shoulder_separation_robust(
         landmarks_over_time, swing_phases, handedness
     )
 
-    # Generate enhanced feedback based on analysis
-    if separation_analysis['max_separation'] and separation_analysis['data_quality'] > 0.6:
+    if separation_analysis.get('max_separation') and separation_analysis.get('data_quality', 0) > 0.6:
         max_sep = separation_analysis['max_separation']['separation']
         avg_sep = separation_analysis['average_separation']
-        
         if max_sep < 15:
             feedback.append({
                 "frame": separation_analysis['max_separation']['frame'],
@@ -1279,7 +1320,6 @@ async def analyze_video_from_url(url: str):
                 "suggested_drill": "Practice smooth kinetic chain drills to improve timing",
                 "severity": "medium"
             })
-        
         print(f"🔄 Hip-shoulder separation: Peak {max_sep:.1f}° (avg: {avg_sep:.1f}°)")
     else:
         feedback.append({
@@ -1289,8 +1329,7 @@ async def analyze_video_from_url(url: str):
             "severity": "low"
         })
 
-    # Enhanced swing phase timing analysis
-    detected_phases = [phase for phase, frame in swing_phases.items() if frame is not None]
+    detected_phases = [p for p, f in swing_phases.items() if f is not None]
     if len(detected_phases) < 3:
         feedback.append({
             "frame": "overall",
@@ -1298,8 +1337,7 @@ async def analyze_video_from_url(url: str):
             "suggested_drill": "Ensure video captures complete swing from stance through follow-through",
             "severity": "medium"
         })
-    
-    # Phase timing validation
+
     if swing_phases.get("swing_start") and swing_phases.get("contact"):
         swing_duration = swing_phases["contact"] - swing_phases["swing_start"]
         if swing_duration < 8:
@@ -1310,7 +1348,6 @@ async def analyze_video_from_url(url: str):
                 "severity": "low"
             })
 
-    # Handedness confidence analysis
     if handedness == "unknown":
         feedback.append({
             "frame": "setup",
@@ -1318,16 +1355,15 @@ async def analyze_video_from_url(url: str):
             "suggested_drill": "Ensure clear side view showing batting stance and initial setup",
             "severity": "high"
         })
-    elif handedness_result["confidence"] < 0.7:
+    elif handedness_result.get("confidence", 0) < 0.7:
         feedback.append({
-            "frame": "setup", 
+            "frame": "setup",
             "issue": f"Handedness detection has moderate confidence ({handedness_result['confidence']:.2f})",
             "suggested_drill": "Verify analysis results - ensure clear side view of batting stance",
             "severity": "low"
         })
 
-    # Data quality assessment
-    data_quality = separation_analysis.get('data_quality', 0)
+    data_quality = separation_analysis.get('data_quality', 0.0)
     if data_quality < 0.7:
         feedback.append({
             "frame": "overall",
@@ -1345,43 +1381,48 @@ async def analyze_video_from_url(url: str):
             "frames_analyzed": len(landmarks_over_time),
             "duration_seconds": duration,
             "data_quality": data_quality
+        },
+        "media": {
+            "input_url": url,
+            "rotation_deg": rotation_deg,
+            "was_rotated": was_rotated
         }
     }
 
-    print("✅ Enhanced analysis complete!")
-    return feedback or [{"message": "No major issues detected. Swing mechanics appear solid!"}], biomarker_results
+    print("✅ Analysis complete (rotation handled locally).")
+    return feedback or [{"message": "No major issues detected."}], biomarker_results, fixed_path
 
+# ---------------- Annotated video generator (works with upright video) ----------------
 
-async def generate_annotated_video(video_url: str, swing_phases: dict) -> str:
-    """Generates an annotated swing video with phase labels and joint overlays."""
-    print(f"🎞️ Generating annotated video for: {video_url}")
+async def generate_annotated_video(input_path: str, swing_phases: dict) -> str:
+    """
+    Generate an annotated upright video saved as 'annotated_output.mp4'.
+    Handles rotation correction if needed.
+    """
 
-    async with httpx.AsyncClient() as client:
-        response = await client.get(video_url)
-        if response.status_code != 200:
-            raise Exception("Failed to download video")
+    # Ensure the video is upright
+    fixed_path, was_rotated, rotation_deg = fix_rotation_if_needed(input_path)
 
-        video_bytes = response.content
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
-        tmp.write(video_bytes)
-        input_video_path = tmp.name
-
-    cap = cv2.VideoCapture(input_video_path)
+    cap = cv2.VideoCapture(fixed_path)
     if not cap.isOpened():
-        raise Exception("Failed to read video")
+        raise Exception("Failed to open video for annotation")
 
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    output_path = "annotated_output.mp4"
-    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 1280)
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 720)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+
+    print(f"📐 Input video (upright): {width}x{height} at {fps:.1f} FPS ({total_frames} frames)")
 
     pose = mp_pose.Pose(static_image_mode=False)
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    output_path = "annotated_output.mp4"
+    writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
 
     frame_idx = 0
-    while cap.isOpened():
+    frames_written = 0
+
+    while True:
         ret, frame = cap.read()
         if not ret:
             break
@@ -1392,80 +1433,84 @@ async def generate_annotated_video(video_url: str, swing_phases: dict) -> str:
         if results.pose_landmarks:
             mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
 
-            # ✅ Draw hip–shoulder separation angle at foot plant
-            if frame_idx == swing_phases.get("foot_plant"):
+            # Annotate hip-shoulder separation at foot plant
+            if swing_phases.get("foot_plant") == frame_idx:
                 landmarks = results.pose_landmarks.landmark
+                def denorm(p): return (int(p.x * width), int(p.y * height))
 
-                # Get shoulder and hip points
-                left_shoulder = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value]
-                right_shoulder = landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value]
-                left_hip = landmarks[mp_pose.PoseLandmark.LEFT_HIP.value]
-                right_hip = landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value]
+                ls = denorm(landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value])
+                rs = denorm(landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value])
+                lh = denorm(landmarks[mp_pose.PoseLandmark.LEFT_HIP.value])
+                rh = denorm(landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value])
 
-                # Convert normalized coordinates to pixel values
-                def denorm(point):
-                    return int(point.x * width), int(point.y * height)
+                cv2.line(frame, ls, rs, (0, 255, 255), 3)   # shoulders: yellow
+                cv2.line(frame, lh, rh, (255, 0, 255), 3)   # hips: magenta
 
-                ls = denorm(left_shoulder)
-                rs = denorm(right_shoulder)
-                lh = denorm(left_hip)
-                rh = denorm(right_hip)
-
-                # Draw lines
-                cv2.line(frame, ls, rs, (0, 255, 255), 2)  # yellow = shoulders
-                cv2.line(frame, lh, rh, (255, 0, 255), 2)  # magenta = hips
-
-                # Calculate angles
                 shoulder_angle = np.degrees(np.arctan2(rs[1] - ls[1], rs[0] - ls[0]))
                 hip_angle = np.degrees(np.arctan2(rh[1] - lh[1], rh[0] - lh[0]))
-                separation = shoulder_angle - hip_angle
-                separation = ((separation + 180) % 360) - 180  # Normalize to -180 to 180
-                separation = abs(separation)
+                separation = abs(((shoulder_angle - hip_angle + 180) % 360) - 180)
 
-                # Display angle on screen
                 cv2.putText(
-                    frame,
-                    f"Hip-Shoulder Sep: {separation:.1f} degrees",
-                    (30, 90),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.9,
-                    (255, 255, 0),
-                    2
+                    frame, f"Hip-Shoulder Sep: {separation:.1f}°",
+                    (30, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 0), 2
                 )
 
+        # Add swing phase label if present
+        for phase, f in swing_phases.items():
+            if f == frame_idx:
+                label = phase.replace("_", " ").title()
+                color = {
+                    "stride_start": (0, 255, 255),
+                    "foot_plant": (255, 165, 0),
+                    "swing_start": (0, 255, 0),
+                    "contact": (255, 0, 0),
+                    "follow_through": (255, 0, 255)
+                }.get(phase, (255, 255, 255))
+                cv2.putText(frame, label, (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3)
+                cv2.putText(frame, label, (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 1)
 
-        # Enhanced phase labeling with colors
-        phase_colors = {
-            "stride_start": (0, 255, 255),    # Yellow
-            "foot_plant": (255, 165, 0),      # Orange  
-            "swing_start": (0, 255, 0),       # Green
-            "contact": (255, 0, 0),           # Red
-            "follow_through": (255, 0, 255)   # Magenta
-        }
-        
-        current_phase = None
-        for phase_name, phase_frame in swing_phases.items():
-            if phase_frame == frame_idx:
-                current_phase = phase_name
-                break
-        
-        if current_phase:
-            label = current_phase.replace("_", " ").title()
-            color = phase_colors.get(current_phase, (255, 255, 255))
-            cv2.putText(frame, f"{label}", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3)
-            cv2.putText(frame, f"{label}", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 1)
+        # Frame counter
+        cv2.putText(frame, f"Frame {frame_idx}", (30, height - 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
-        cv2.putText(frame, f"Frame {frame_idx}", (30, height-30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-
-        out.write(frame)
+        writer.write(frame)
+        frames_written += 1
         frame_idx += 1
 
     cap.release()
-    out.release()
-    os.remove(input_video_path)
+    writer.release()
+    pose.close()
 
-    print(f"✅ Enhanced annotated video saved to: {output_path}")
+    print(f"✅ Annotated video written to: {output_path} ({frames_written} frames)")
+
+    # Clean up rotated temp file if needed
+    try:
+        if was_rotated and os.path.exists(fixed_path):
+            os.remove(fixed_path)
+            print(f"🗑️ Cleaned up rotated temp file: {fixed_path}")
+    except Exception as e:
+        print(f"⚠️ Cleanup error: {e}")
+
     return output_path
 
+# ---------------- Download helper ----------------
 
+async def _download_temp(url: str) -> str:
+    """
+    Download the video to a temp .mp4 and return the local path.
+    No rotation detection/correction. Generous timeout for mobile uploads.
+    """
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    tmp_path = tmp.name
+    tmp.close()
 
+    timeout = httpx.Timeout(120.0, connect=20.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        async with client.stream("GET", url) as resp:
+            resp.raise_for_status()
+            with open(tmp_path, "wb") as f:
+                async for chunk in resp.aiter_bytes():
+                    f.write(chunk)
+    
+    print(f"📥 Downloaded video to: {tmp_path}")
+    return tmp_path
