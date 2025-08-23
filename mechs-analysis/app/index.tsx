@@ -1,12 +1,10 @@
-import { ThemedText } from "@/components/ThemedText";
-import { supabase } from "@/lib/supabase";
-import { useRouter } from "expo-router";
-import { useState, useEffect } from "react";
+import { useEffect, useState } from 'react';
+import { Redirect, router } from 'expo-router';
+import { supabase } from '@/lib/supabase';
 import {
-  ActivityIndicator,
   Dimensions,
-  KeyboardAvoidingView,
   Keyboard,
+  KeyboardAvoidingView,
   Platform,
   Pressable,
   ScrollView,
@@ -14,33 +12,47 @@ import {
   TextInput,
   TouchableWithoutFeedback,
   View,
-} from "react-native";
+} from 'react-native';
+import { ThemedText } from '@/components/ThemedText';
 import Animated, {
+  Easing,
   useSharedValue,
   useAnimatedStyle,
   withRepeat,
   withTiming,
-  Easing,
-} from "react-native-reanimated";
-import { LinearGradient } from "expo-linear-gradient";
+} from 'react-native-reanimated';
+import { LinearGradient } from 'expo-linear-gradient';
 
-const { width: SCREEN_WIDTH } = Dimensions.get("window");
 
-export default function RegisterScreen() {
-  const router = useRouter();
-  const [fullName, setFullName] = useState("");
-  const [email, setEmail] = useState("");
-  const [username, setUsername] = useState("");
-  const [password, setPassword] = useState("");
+const { width: SCREEN_WIDTH } = Dimensions.get('window');
+
+export default function IndexScreen() {
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [signedIn, setSignedIn] = useState(false);
 
   const glow = useSharedValue(0.4);
   const surge = useSharedValue(-400);
 
   useEffect(() => {
+    const checkSession = async () => {
+      const { data } = await supabase.auth.getSession();
+      if (data.session) {
+        setSignedIn(true);
+      }
+    };
+    checkSession();
+  }, []);
+
+  useEffect(() => {
     if (!loading) {
-      glow.value = withRepeat(withTiming(1, { duration: 1500, easing: Easing.inOut(Easing.ease) }), -1, true);
+      glow.value = withRepeat(
+        withTiming(1, { duration: 1500, easing: Easing.inOut(Easing.ease) }),
+        -1,
+        true
+      );
     } else {
       glow.value = withTiming(0, { duration: 300 });
       surge.value = withTiming(0, { duration: 0 });
@@ -55,91 +67,48 @@ export default function RegisterScreen() {
     transform: [{ translateX: surge.value }],
   }));
 
-  const handleRegister = async () => {
+  const handleSignIn = async () => {
     setLoading(true);
     setError(null);
 
-    const { data: existingUser, error: checkUserError } = await supabase
-      .from("User")
-      .select("id")
-      .eq("username", username)
+    const { data: userRecord, error: userCheckError } = await supabase
+      .from('User')
+      .select('email')
+      .eq('username', username)
       .maybeSingle();
 
-    if (checkUserError) {
+    if (userCheckError || !userRecord) {
       setLoading(false);
-      setError("Error checking username. Please try again.");
-      return;
-    }
-    if (existingUser) {
-      setLoading(false);
-      setError("Username already taken.");
+      setError(userCheckError ? 'Error checking user.' : 'User not found.');
       return;
     }
 
-    const { data: existingEmail, error: checkEmailError } = await supabase
-      .from("User")
-      .select("id")
-      .ilike("email", email)
-      .maybeSingle();
-
-    if (checkEmailError) {
-      setLoading(false);
-      setError("Error checking email. Please try again.");
-      return;
-    }
-    if (existingEmail) {
-      setLoading(false);
-      setError("Email already in use.");
-      return;
-    }
-
-    const { data, error: signUpError } = await supabase.auth.signUp({
-      email,
+    const { error: signInError } = await supabase.auth.signInWithPassword({
+      email: userRecord.email,
       password,
-      options: {
-        data: {
-          full_name: fullName,
-          username: username,
-        },
-      },
     });
 
-    if (signUpError) {
-      setLoading(false);
-      setError(signUpError.message);
-      return;
+    if (signInError) {
+      setError('Incorrect password.');
+    } else {
+      setSignedIn(true);
     }
-
-    if (data.user) {
-      const { error: insertError } = await supabase.from("User").insert([
-        {
-          username,
-          email,
-          full_name: fullName,
-        },
-      ]);
-      if (insertError) {
-        setLoading(false);
-        setError(insertError.message);
-        return;
-      }
-    }
-
     setLoading(false);
-    router.replace("/(tabs)/upload");
   };
+
+  if (signedIn) return <Redirect href="/(tabs)/upload" />;
 
   return (
     <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
       <KeyboardAvoidingView
         style={{ flex: 1 }}
-        behavior={Platform.OS === "ios" ? "padding" : "height"}
-        keyboardVerticalOffset={Platform.OS === "ios" ? 0 : 20}
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 20}
       >
         <View style={styles.container}>
           <View style={styles.bg} pointerEvents="none">
             <LinearGradient
-              colors={["#0f1f18", "#123224", "#0f1f18"]}
+              colors={['#0f1f18', '#123224', '#0f1f18']}
               start={{ x: 0, y: 0 }}
               end={{ x: 1, y: 1 }}
               style={StyleSheet.absoluteFillObject}
@@ -147,23 +116,14 @@ export default function RegisterScreen() {
           </View>
 
           <ScrollView
-            contentContainerStyle={{ paddingBottom: 40, paddingHorizontal: 24, flexGrow: 1, justifyContent: "center" }}
+            contentContainerStyle={styles.scrollContent}
             keyboardShouldPersistTaps="handled"
             showsVerticalScrollIndicator={false}
           >
             <View style={styles.card}>
-              <ThemedText type="title" style={styles.title}>Create Account</ThemedText>
+              <ThemedText type="title" style={styles.title}>SwingGPT</ThemedText>
+              <ThemedText style={styles.subtitle}>Unlock your swing breakdown</ThemedText>
 
-              <View style={styles.inputGroup}>
-                <ThemedText style={styles.label}>Full Name</ThemedText>
-                <TextInput
-                  style={styles.input}
-                  placeholder="Full Name"
-                  value={fullName}
-                  onChangeText={setFullName}
-                  autoCapitalize="words"
-                />
-              </View>
               <View style={styles.inputGroup}>
                 <ThemedText style={styles.label}>Username</ThemedText>
                 <TextInput
@@ -174,17 +134,7 @@ export default function RegisterScreen() {
                   autoCapitalize="none"
                 />
               </View>
-              <View style={styles.inputGroup}>
-                <ThemedText style={styles.label}>Email</ThemedText>
-                <TextInput
-                  style={styles.input}
-                  placeholder="Email"
-                  value={email}
-                  onChangeText={setEmail}
-                  autoCapitalize="none"
-                  keyboardType="email-address"
-                />
-              </View>
+
               <View style={styles.inputGroup}>
                 <ThemedText style={styles.label}>Password</ThemedText>
                 <TextInput
@@ -198,25 +148,22 @@ export default function RegisterScreen() {
               </View>
 
               {error && (
-                <ThemedText style={styles.error}>
-                  {error}
-                </ThemedText>
+                <ThemedText style={styles.error}>{error}</ThemedText>
               )}
 
               <Animated.View style={[styles.glowWrapper, glowStyle]}>
                 <Pressable
                   style={[styles.button, loading && styles.disabledButton]}
-                  onPress={handleRegister}
+                  onPress={handleSignIn}
                   disabled={loading}
                 >
                   <ThemedText style={styles.buttonText}>
-                    {loading ? "Creating..." : "Register"}
+                    {loading ? 'Authenticating...' : 'Enter'}
                   </ThemedText>
-
                   {loading && (
                     <Animated.View style={[styles.surgeBar, surgeStyle]}>
                       <LinearGradient
-                        colors={["transparent", "#ffffff66", "transparent"]}
+                        colors={['transparent', '#ffffff66', 'transparent']}
                         start={{ x: 0, y: 0 }}
                         end={{ x: 1, y: 0 }}
                         style={styles.surgeLine}
@@ -225,6 +172,18 @@ export default function RegisterScreen() {
                   )}
                 </Pressable>
               </Animated.View>
+
+              <Pressable
+                style={({ pressed }) => [
+                  styles.registerButton,
+                  pressed && { opacity: 0.75 },
+                ]}
+                onPress={() => router.push('/register')}
+              >
+                <ThemedText style={styles.registerText}>
+                  Don’t have an account? Register
+                </ThemedText>
+              </Pressable>
             </View>
           </ScrollView>
         </View>
@@ -236,19 +195,26 @@ export default function RegisterScreen() {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: "#082419",
+    backgroundColor: '#082419',
   },
   bg: {
     ...StyleSheet.absoluteFillObject,
     zIndex: -1,
   },
+  scrollContent: {
+    paddingBottom: 40,
+    paddingHorizontal: 24,
+    flexGrow: 1,
+    justifyContent: 'center',
+  },
   card: {
-    backgroundColor: "#1a2e25",
+    width: SCREEN_WIDTH < 400 ? '100%' : 360,
+    backgroundColor: '#1a2e25',
     borderRadius: 20,
     padding: 24,
     borderWidth: 2,
-    borderColor: "#ffffff33",
-    shadowColor: "#000",
+    borderColor: '#ffffff33',
+    shadowColor: '#000',
     shadowOffset: { width: 0, height: 10 },
     shadowOpacity: 0.2,
     shadowRadius: 20,
@@ -256,73 +222,81 @@ const styles = StyleSheet.create({
   },
   title: {
     fontSize: 26,
-    fontWeight: "900",
-    color: "#ffffff",
+    fontWeight: '900',
+    color: '#ffffff',
     letterSpacing: 2,
-    textAlign: "center",
-    marginBottom: 16,
-    textShadowColor: "#f44336",
+    textAlign: 'center',
+    marginBottom: 6,
+    textShadowColor: '#f44336',
     textShadowOffset: { width: 0, height: 0 },
     textShadowRadius: 10,
   },
+  subtitle: {
+    color: '#d5ead6',
+    fontSize: 15,
+    textAlign: 'center',
+    fontWeight: '500',
+    marginBottom: 20,
+  },
   inputGroup: {
-    marginBottom: 16,
+    marginBottom: 14,
   },
   label: {
-    color: "#e0f2f1",
-    fontWeight: "600",
+    color: '#e0f2f1',
+    fontWeight: '600',
     fontSize: 15,
     marginBottom: 6,
   },
   input: {
     height: 44,
-    backgroundColor: "#243c32",
+    backgroundColor: '#243c32',
     borderRadius: 10,
     paddingHorizontal: 12,
-    color: "#fff",
+    color: '#fff',
     borderWidth: 1,
-    borderColor: "#ffffff22",
+    borderColor: '#ffffff22',
     fontSize: 15,
   },
   error: {
-    color: "#f88",
+    color: '#f88',
     fontSize: 14,
-    fontWeight: "600",
-    textAlign: "center",
+    fontWeight: '600',
+    textAlign: 'center',
     marginTop: 6,
   },
   button: {
-    backgroundColor: "#f44336",
+    backgroundColor: '#f44336',
     paddingVertical: 16,
     borderRadius: 16,
-    alignItems: "center",
+    alignItems: 'center',
     marginTop: 16,
     borderWidth: 2,
-    borderColor: "#ffffff88",
-    shadowColor: "#f44336",
+    borderColor: '#ffffff88',
+    shadowColor: '#f44336',
     shadowOffset: { width: 0, height: 6 },
     shadowOpacity: 0.3,
     shadowRadius: 12,
     elevation: 6,
-    overflow: "hidden",
+    overflow: 'hidden',
   },
   disabledButton: {
     opacity: 0.65,
   },
   buttonText: {
-    color: "#fff",
+    color: '#fff',
     fontSize: 16,
-    fontWeight: "900",
+    fontWeight: '900',
     letterSpacing: 1,
-    textTransform: "uppercase",
+    textTransform: 'uppercase',
   },
   glowWrapper: {
-    shadowColor: "#ffffff",
+    shadowColor: '#ffffff',
     shadowOffset: { width: 0, height: 0 },
     shadowRadius: 18,
+    marginTop: 12,
   },
   surgeBar: {
-    position: "absolute",
+    position: 'absolute',
     left: -400,
     top: 0,
     bottom: 0,
@@ -332,5 +306,15 @@ const styles = StyleSheet.create({
   surgeLine: {
     flex: 1,
     opacity: 0.3,
+  },
+  registerButton: {
+    marginTop: 14,
+    alignItems: 'center',
+  },
+  registerText: {
+    color: '#a5d6a7',
+    fontWeight: '600',
+    fontSize: 14,
+    textDecorationLine: 'underline',
   },
 });

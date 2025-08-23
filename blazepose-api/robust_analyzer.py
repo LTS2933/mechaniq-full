@@ -90,7 +90,6 @@ class RobustBaseballSwingAnalyzer:
         except:
             return None
 
-
     def detect_handedness_fusion(self, landmarks_over_time):
         """
         Detect handedness based on which direction the face is turned.
@@ -98,11 +97,18 @@ class RobustBaseballSwingAnalyzer:
         If face points right → likely left-handed (facing camera left).
         If face points left → likely right-handed (facing camera right).
         """
+        print("🔍 Starting handedness detection...")
+        
         if len(landmarks_over_time) < 10:
+            print("❌ Insufficient frames for handedness detection")
             return {"handedness": "unknown", "confidence": 0.0, "debug": "Insufficient frames"}
 
         max_frames = min(40, len(landmarks_over_time))
         direction_scores = []
+        valid_frames = 0
+        low_visibility_frames = 0
+        
+        print(f"📊 Analyzing {max_frames} frames for face direction...")
 
         for i in range(max_frames):
             lm = landmarks_over_time[i]
@@ -114,35 +120,115 @@ class RobustBaseballSwingAnalyzer:
                 lear = lm[mp_pose.PoseLandmark.LEFT_EAR.value]
                 rear = lm[mp_pose.PoseLandmark.RIGHT_EAR.value]
 
-                if min(nose.visibility, leye.visibility, reye.visibility, lear.visibility, rear.visibility) < 0.5:
+                # Check visibility
+                min_visibility = min(nose.visibility, leye.visibility, reye.visibility, lear.visibility, rear.visibility)
+                
+                if min_visibility < 0.5:
+                    low_visibility_frames += 1
+                    if i < 10:  # Debug first 10 frames
+                        print(f"   Frame {i}: Low visibility ({min_visibility:.2f}) - skipping")
                     continue
 
-                # Distances from nose to eyes/ears
+                # Calculate distances from nose to eyes/ears
                 dist_nose_to_leye = nose.x - leye.x
                 dist_nose_to_reye = reye.x - nose.x
                 dist_nose_to_lear = nose.x - lear.x
                 dist_nose_to_rear = rear.x - nose.x
 
+                # Individual components
+                eye_component = dist_nose_to_reye - dist_nose_to_leye
+                ear_component = dist_nose_to_rear - dist_nose_to_lear
+                
                 # Combine signals: negative means facing right (right-handed), positive means facing left (left-handed)
-                direction_score = (
-                    dist_nose_to_reye - dist_nose_to_leye +
-                    dist_nose_to_rear - dist_nose_to_lear
-                )
+                direction_score = eye_component + ear_component
                 direction_scores.append(direction_score)
+                valid_frames += 1
+                
+                # Debug output for first few valid frames
+                if valid_frames <= 5:
+                    face_direction = "LEFT" if direction_score > 0 else "RIGHT"
+                    print(f"   Frame {i}: score={direction_score:.4f} → facing {face_direction}")
+                    print(f"      Eye component: {eye_component:.4f} (R-eye dist: {dist_nose_to_reye:.3f}, L-eye dist: {dist_nose_to_leye:.3f})")
+                    print(f"      Ear component: {ear_component:.4f} (R-ear dist: {dist_nose_to_rear:.3f}, L-ear dist: {dist_nose_to_lear:.3f})")
 
             except Exception as e:
+                if i < 10:  # Debug first 10 frames
+                    print(f"   Frame {i}: Error processing landmarks - {e}")
                 continue
 
+        print(f"📈 Processing results: {valid_frames} valid frames, {low_visibility_frames} low visibility frames")
+
         if len(direction_scores) < 5:
+            print("❌ Too few valid face frames for reliable detection")
             return {"handedness": "unknown", "confidence": 0.0, "debug": "Too few valid face frames"}
 
+        # Calculate statistics
         avg_score = sum(direction_scores) / len(direction_scores)
+        score_std = np.std(direction_scores) if len(direction_scores) > 1 else 0.0
+        positive_scores = sum(1 for s in direction_scores if s > 0)
+        negative_scores = sum(1 for s in direction_scores if s < 0)
+        
+        print(f"📊 Score Analysis:")
+        print(f"   Average score: {avg_score:.4f}")
+        print(f"   Score std dev: {score_std:.4f}")
+        print(f"   Positive scores (facing left): {positive_scores}/{len(direction_scores)} ({positive_scores/len(direction_scores)*100:.1f}%)")
+        print(f"   Negative scores (facing right): {negative_scores}/{len(direction_scores)} ({negative_scores/len(direction_scores)*100:.1f}%)")
+        print(f"   Score range: [{min(direction_scores):.4f}, {max(direction_scores):.4f}]")
 
         if abs(avg_score) < 0.01:
-            return {"handedness": "unknown", "confidence": 0.0, "debug": "Face direction too ambiguous"}
+            print("❌ Face direction too ambiguous (average score near zero)")
+            print("🔄 Attempting hand-shoulder proximity backup detection...")
+            return self._detect_handedness_by_hand_position(landmarks_over_time)
 
-        handedness = "left" if avg_score > 0 else "right"
+        # Determine handedness
+        if avg_score > 0:
+            handedness = "left"
+            reasoning = f"Face pointing LEFT (avg score: {avg_score:.4f} > 0) → LEFT-handed batter"
+        else:
+            handedness = "right"  
+            reasoning = f"Face pointing RIGHT (avg score: {avg_score:.4f} < 0) → RIGHT-handed batter"
+        
         confidence = round(min(abs(avg_score) * 10, 1.0), 2)
+        
+        # Additional confidence factors
+        consistency = (max(positive_scores, negative_scores) / len(direction_scores))
+        if consistency >= 0.8:
+            confidence_level = "VERY HIGH"
+        elif consistency >= 0.7:
+            confidence_level = "HIGH" 
+        elif consistency >= 0.6:
+            confidence_level = "MODERATE"
+        else:
+            confidence_level = "LOW"
+        
+        # Check face detection confidence - if not 100% consistent, use backup method
+        face_confidence_threshold = 0.98  # 95% of frames must agree
+        if consistency < face_confidence_threshold:
+            print(f"⚠️ Face detection consistency ({consistency:.1%}) below threshold ({face_confidence_threshold:.1%})")
+            print("🔄 Using hand-shoulder proximity as backup verification...")
+            
+            backup_result = self._detect_handedness_by_hand_position(landmarks_over_time)
+            
+            if backup_result["handedness"] != "unknown":
+                if backup_result["handedness"] == handedness:
+                    print(f"✅ Hand-shoulder method CONFIRMS face detection: {handedness}")
+                    confidence = min(1.0, confidence + 0.1)  # Boost confidence slightly
+                else:
+                    print(f"🚨 Hand-shoulder method CONTRADICTS face detection!")
+                    print(f"   Face method: {handedness} (confidence: {confidence})")
+                    print(f"   Hand method: {backup_result['handedness']} (confidence: {backup_result['confidence']})")
+                    
+                    # Use the method with higher confidence
+                    if backup_result["confidence"] > confidence:
+                        print(f"📊 Using hand-shoulder result due to higher confidence")
+                        return backup_result
+                    else:
+                        print(f"📊 Keeping face detection result due to higher confidence")
+        
+        print(f"✅ {confidence_level} CONFIDENCE Detection:")
+        print(f"   {reasoning}")
+        print(f"   Consistency: {consistency:.1%} of frames agree")
+        print(f"   Final confidence score: {confidence}")
 
         return {
             "handedness": handedness,
@@ -150,10 +236,120 @@ class RobustBaseballSwingAnalyzer:
             "debug": {
                 "method": "face direction via relative eye/ear distances",
                 "avg_direction_score": round(avg_score, 4),
-                "frames_used": len(direction_scores)
+                "frames_used": len(direction_scores),
+                "score_std": round(score_std, 4),
+                "consistency": round(consistency, 3),
+                "positive_frames": positive_scores,
+                "negative_frames": negative_scores,
+                "reasoning": reasoning,
+                "confidence_level": confidence_level
             }
         }
-    
+
+    def _detect_handedness_by_hand_position(self, landmarks_over_time):
+        """
+        Backup handedness detection using hand-shoulder proximity.
+        Left-handed: hands closer to left shoulder
+        Right-handed: hands closer to right shoulder
+        """
+        print("🤲 Starting hand-shoulder proximity analysis...")
+        
+        valid_measurements = []
+        
+        for i, lm in enumerate(landmarks_over_time[:30]):  # Check first 30 frames
+            try:
+                # Get shoulder positions
+                left_shoulder = lm[mp_pose.PoseLandmark.LEFT_SHOULDER.value]
+                right_shoulder = lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value]
+                
+                # Get hand positions (wrists as proxy for hands)
+                left_wrist = lm[mp_pose.PoseLandmark.LEFT_WRIST.value]
+                right_wrist = lm[mp_pose.PoseLandmark.RIGHT_WRIST.value]
+                
+                # Check visibility
+                min_visibility = min(left_shoulder.visibility, right_shoulder.visibility, 
+                                    left_wrist.visibility, right_wrist.visibility)
+                
+                if min_visibility < 0.5:
+                    continue
+                
+                # Calculate hand center
+                hand_center_x = (left_wrist.x + right_wrist.x) / 2
+                hand_center_y = (left_wrist.y + right_wrist.y) / 2
+                
+                # Calculate distances from hand center to each shoulder
+                dist_to_left_shoulder = np.sqrt(
+                    (hand_center_x - left_shoulder.x)**2 + 
+                    (hand_center_y - left_shoulder.y)**2
+                )
+                
+                dist_to_right_shoulder = np.sqrt(
+                    (hand_center_x - right_shoulder.x)**2 + 
+                    (hand_center_y - right_shoulder.y)**2
+                )
+                
+                # Score: negative = closer to left shoulder (lefty), positive = closer to right shoulder (righty)
+                proximity_score = dist_to_left_shoulder - dist_to_right_shoulder
+                
+                valid_measurements.append(proximity_score)
+                
+                # Debug first few measurements
+                if len(valid_measurements) <= 3:
+                    closer_to = "LEFT shoulder" if proximity_score < 0 else "RIGHT shoulder"
+                    suggested_handedness = "LEFT-handed" if proximity_score < 0 else "RIGHT-handed"
+                    print(f"   Frame {i}: hands closer to {closer_to} → suggests {suggested_handedness}")
+                    print(f"      Distance to L-shoulder: {dist_to_left_shoulder:.3f}")
+                    print(f"      Distance to R-shoulder: {dist_to_right_shoulder:.3f}")
+                    print(f"      Proximity score: {proximity_score:.4f}")
+                
+            except Exception as e:
+                continue
+        
+        if len(valid_measurements) < 5:
+            print("❌ Not enough valid hand-shoulder measurements")
+            return {"handedness": "unknown", "confidence": 0.0, "debug": "Insufficient hand-shoulder data"}
+        
+        # Analyze results
+        avg_proximity = np.mean(valid_measurements)
+        left_count = sum(1 for score in valid_measurements if score < 0)
+        right_count = sum(1 for score in valid_measurements if score > 0)
+        consistency = max(left_count, right_count) / len(valid_measurements)
+        
+        print(f"📊 Hand-Shoulder Analysis:")
+        print(f"   Average proximity score: {avg_proximity:.4f}")
+        print(f"   Closer to left shoulder: {left_count}/{len(valid_measurements)} ({left_count/len(valid_measurements)*100:.1f}%)")
+        print(f"   Closer to right shoulder: {right_count}/{len(valid_measurements)} ({right_count/len(valid_measurements)*100:.1f}%)")
+        print(f"   Consistency: {consistency:.1%}")
+        
+        if abs(avg_proximity) < 0.01:
+            print("❌ Hand position too ambiguous (equal distance to both shoulders)")
+            return {"handedness": "unknown", "confidence": 0.0, "debug": "Hands equidistant from shoulders"}
+        
+        # Determine handedness
+        if avg_proximity < 0:
+            handedness = "left"
+            reasoning = f"Hands closer to LEFT shoulder (avg score: {avg_proximity:.4f}) → LEFT-handed"
+        else:
+            handedness = "right"
+            reasoning = f"Hands closer to RIGHT shoulder (avg score: {avg_proximity:.4f}) → RIGHT-handed"
+        
+        confidence = min(abs(avg_proximity) * 5 + consistency * 0.3, 1.0)  # Scale differently than face detection
+        
+        print(f"✅ Hand-shoulder detection result:")
+        print(f"   {reasoning}")
+        print(f"   Confidence: {confidence:.2f}")
+        
+        return {
+            "handedness": handedness,
+            "confidence": confidence,
+            "debug": {
+                "method": "hand-shoulder proximity analysis",
+                "avg_proximity_score": round(avg_proximity, 4),
+                "measurements_used": len(valid_measurements),
+                "consistency": round(consistency, 3),
+                "reasoning": reasoning
+            }
+        }    
     
     def detect_precise_swing_timing(self, landmarks_over_time, handedness):
         """
@@ -217,6 +413,11 @@ class RobustBaseballSwingAnalyzer:
             'hip_center_x': [], 'hip_center_y': [],
             # NEW: optional face center (kept aligned; may contain NaN)
             'face_center_x': [], 'face_center_y': [],
+            # NEW: foot landmarks for robust foot plant detection
+            'lead_heel_x': [], 'lead_heel_y': [],
+            'back_heel_x': [], 'back_heel_y': [],
+            'lead_foot_index_x': [], 'lead_foot_index_y': [],
+            'back_foot_index_x': [], 'back_foot_index_y': [],
         }
 
         landmark_indices = {
@@ -232,6 +433,11 @@ class RobustBaseballSwingAnalyzer:
             'back_wrist':   getattr(mp_pose.PoseLandmark, f'{back_side}_WRIST').value,
             'lead_elbow':   getattr(mp_pose.PoseLandmark, f'{lead_side}_ELBOW').value,
             'back_elbow':   getattr(mp_pose.PoseLandmark, f'{back_side}_ELBOW').value,
+            # Add foot landmarks
+            'lead_heel':    getattr(mp_pose.PoseLandmark, f'{lead_side}_HEEL').value,
+            'back_heel':    getattr(mp_pose.PoseLandmark, f'{back_side}_HEEL').value,
+            'lead_foot_index': getattr(mp_pose.PoseLandmark, f'{lead_side}_FOOT_INDEX').value,
+            'back_foot_index': getattr(mp_pose.PoseLandmark, f'{back_side}_FOOT_INDEX').value,
         }
 
         # Face landmarks (optional; we won't reject the frame if these are missing)
@@ -379,114 +585,52 @@ class RobustBaseballSwingAnalyzer:
         return None
     
 
-
-
+    # --- Rewritten Foot Plant Detection ---
     def _detect_foot_plant_adaptive(self, data, stride_start, video_length):
         """
-        Detects foot plant using dual-ankle comparison with intelligent fallback to best candidate.
+        Detect foot plant by checking when at least 2 of 3 lead foot landmarks 
+        (ankle, heel, foot_index) align in Y-position with the corresponding back foot landmarks.
+        Returns immediately when a frame meets the 2/3 requirement.
         """
         if stride_start is None or len(data['lead_ankle_y']) < 10:
-            print("🚫 Not enough ankle data or stride_start is None.")
-            return None
-
-        if 'back_ankle_y' not in data or len(data['back_ankle_y']) != len(data['lead_ankle_y']):
-            print("⚠️ No trail ankle data available, falling back to single-ankle method.")
+            print("🚫 Not enough data to detect foot plant.")
             return None
 
         try:
             stride_index = next(i for i, f in enumerate(data['frames']) if f >= stride_start)
         except StopIteration:
-            print("⚠️ Stride start not found in frames, using index 0.")
-            stride_index = 0
+            print("⚠️ Could not find stride start in frame list.")
+            return None
 
-        fps = len(data['frames']) / video_length if video_length > 0 else 30
-        fps = max(fps, 10)
-        smoothing_sigma = max(0.8, fps / 60)
+        fps = max(len(data['frames']) / video_length if video_length > 0 else 30, 10)
+        search_start = stride_index + max(5, int(0.3 * fps))
+        search_end = min(len(data['frames']) - 5, stride_index + int(5.0 * fps))
 
-        smoothed_lead_y = gaussian_filter1d(data['lead_ankle_y'], sigma=smoothing_sigma)
-        smoothed_back_y = gaussian_filter1d(data['back_ankle_y'], sigma=smoothing_sigma)
-        ankle_separation = smoothed_back_y - smoothed_lead_y
+        #print(f"🔍 Looking for foot plant from frame {data['frames'][search_start]} to {data['frames'][search_end]}")
 
-        search_start = stride_index
-        search_duration = int(4.5 * fps)
-        search_end = min(search_start + search_duration, len(smoothed_lead_y) - 10)
+        tolerance = 0.04
+        required_matches = 2  # at least 2 of 3 landmarks must match
 
-        min_stability_frames = max(2, int(0.08 * fps))
-        max_stability_frames = max(10, int(0.5 * fps))
-        stability_threshold = 0.0008
+        for i in range(search_start, search_end):
+            current_frame = data['frames'][i]
+            
+            ankle_diff = data['lead_ankle_y'][i] - data['back_ankle_y'][i]
+            heel_diff = data['lead_heel_y'][i] - data['back_heel_y'][i]
+            foot_diff = data['lead_foot_index_y'][i] - data['back_foot_index_y'][i]
 
-        baseline_abs_separation = np.median(np.abs(ankle_separation[stride_index:stride_index + min(20, len(ankle_separation)//4)]))
-        convergence_threshold = min(0.02, baseline_abs_separation * 0.3)
+            diffs = [ankle_diff, heel_diff, foot_diff]
+            num_pass = sum(abs(d) <= tolerance for d in diffs)
 
-        #print(f"🦶 Convergence threshold: {convergence_threshold:.4f}")
-        #print(f"🕒 Stability: {min_stability_frames}-{max_stability_frames} frames | σ: {smoothing_sigma:.2f} | FPS: {fps:.2f}")
+            #print(f"🧪 Frame {current_frame}: ankle={ankle_diff:.4f}, heel={heel_diff:.4f}, foot={foot_diff:.4f} → {num_pass}/3 pass")
 
-        best_score = -1
-        best_frame = None
+            if num_pass >= required_matches:
+                print(f"✅ Foot plant detected at frame {current_frame} ({num_pass}/3 landmarks aligned)")
+                return current_frame
 
-        for i in range(search_start + 1, search_end - max_stability_frames):
-            prev_lead = smoothed_lead_y[i - 1]
-            curr_lead = smoothed_lead_y[i]
-            next_lead = smoothed_lead_y[i + 1]
-            is_local_min = prev_lead > curr_lead < next_lead
-
-            curr_sep = ankle_separation[i]
-            curr_abs_sep = abs(curr_sep)
-            feet_converged = curr_abs_sep < convergence_threshold
-
-            # Check nearby for convergence
-            feet_converged_nearby = (
-                feet_converged or
-                (i > 0 and abs(ankle_separation[i - 1]) < convergence_threshold) or
-                (i + 1 < len(ankle_separation) and abs(ankle_separation[i + 1]) < convergence_threshold)
-            )
-
-            score = 0
-            if is_local_min:
-                score += 1
-            if feet_converged_nearby:
-                score += 1
-
-            # Try to find a stability window
-            for window_size in range(min_stability_frames, max_stability_frames + 1):
-                if i + window_size >= len(smoothed_lead_y):
-                    break
-
-                lead_var = np.var(smoothed_lead_y[i:i + window_size])
-                sep_window = np.abs(ankle_separation[i:i + window_size])
-                sep_var = np.var(sep_window)
-                sep_mean = np.mean(sep_window)
-
-                lead_stable = lead_var < stability_threshold
-                conv_stable = sep_var < stability_threshold * 1.5
-                conv_maintained = sep_mean < convergence_threshold * 1.2
-
-                if lead_stable:
-                    score += 0.5
-                if conv_stable and conv_maintained:
-                    score += 0.5
-
-                if score >= 2.0:
-                    print(f"🎯 FOOT PLANT ~CONFIRMED at frame {data['frames'][i]} (score {score})")
-                    return data['frames'][i]
-                break  # Exit after 1 window attempt to keep search fast
-
-            if score > best_score:
-                best_score = score
-                best_frame = data['frames'][i]
-
-
-            #print(f"🧪 Frame {data['frames'][i]}: local_min={is_local_min}, converged_nearby={feet_converged_nearby}, score={score}")
-
-        print("⚠️ No perfect foot plant frame found. Best guess:")
-
-        if best_score >= 1.5:
-            print(f"✅ Using best candidate frame {best_frame} with score {best_score}")
-            return best_frame
-
-        print("🚫 No sufficiently confident foot plant frame.")
+        print("⚠️ No clear foot plant frame found.")
         return None
 
+    # --- Rewritten Swing Start Detection ---
     def _detect_swing_start_adaptive(
         self,
         data,
@@ -494,86 +638,101 @@ class RobustBaseballSwingAnalyzer:
         video_length: int,
         handedness: str,
         *,
-        fps: float | None = None,           # only used to cap to ~3s
+        fps: float | None = None,
         smooth_sigma: float = 0.6,
         min_dx_units: float = 0.0015,
-        min_center_step_units: float = 0.001
+        min_center_step_units: float = 0.001,
+        shoulder_weight: float = 0.7,
+        hip_weight: float = 0.3,
+        debug: bool = True,
+        return_debug: bool = False
     ):
         if foot_plant_frame is None:
-            print("❌ No foot plant frame provided. Cannot determine swing start.")
+            if debug:
+                print("❌ No foot plant frame provided.")
             return None
 
         def _smooth1d(x, sigma):
             x = np.asarray(x, float)
             if sigma and sigma > 0:
-                n = len(x); idx = np.arange(n); m = np.isfinite(x)
-                if n and (not m.all()) and m.any():
-                    x = x.copy(); x[~m] = np.interp(idx[~m], idx[m], x[m])
-                from scipy.ndimage import gaussian_filter1d
+                n = len(x)
+                idx = np.arange(n)
+                m = np.isfinite(x)
+                if n and not m.all() and m.any():
+                    x = x.copy()
+                    x[~m] = np.interp(idx[~m], idx[m], x[m])
                 x = gaussian_filter1d(x, sigma=sigma)
             return x
 
         frames = np.asarray(data["frames"])
         plant_i = int(np.searchsorted(frames, foot_plant_frame, side="left"))
         if plant_i >= len(frames) - 2:
-            print("❌ Not enough frames after foot plant.")
+            if debug:
+                print("❌ Not enough frames after foot plant.")
             return None
 
-        # --- cap search to ~3 seconds after FP (or 90 frames if fps unknown) ---
         max_after = int(3 * fps) if (fps and fps > 0) else 90
         search_end_i = min(len(frames) - 1, plant_i + max_after)
-        print(f"🔎 Swing-start scan window: idx[{plant_i+1}..{search_end_i}]")
+        if debug:
+           print(f"🔎 Swing-start scan window: idx[{plant_i + 1}..{search_end_i}]")
 
-        # --- mid-hands and mid-shoulders (smoothed) ---
         Lx = _smooth1d(data["lead_wrist_x"], smooth_sigma)
-        Bx = _smooth1d(data["back_wrist_x"],  smooth_sigma)
-        Hx = 0.5*(Lx + Bx)
+        Bx = _smooth1d(data["back_wrist_x"], smooth_sigma)
+        Hx = 0.5 * (Lx + Bx)
 
         Lsx = _smooth1d(data["lead_shoulder_x"], 0.8)
         Bsx = _smooth1d(data["back_shoulder_x"], 0.8)
-        Sx  = 0.5*(Lsx + Bsx)
+        Shx = 0.5 * (Lsx + Bsx)
 
-        # OPTIONAL: blend in hip center to make the “center line” even stabler
-        # Hx_c = np.asarray(data.get("hip_center_x", [np.nan]*len(Sx)), float)
-        # if np.isfinite(Hx_c).sum() > len(Sx)*0.7:
-        #     center_series = 0.5*Sx + 0.5*_smooth1d(Hx_c, 1.0)
-        # else:
-        #     center_series = Sx
+        Hcx = _smooth1d(data.get("hip_center_x", [np.nan] * len(Shx)), 1.0)
+        use_hip = np.isfinite(Hcx).sum() > 0.7 * len(Hcx)
+        CenterX = shoulder_weight * Shx + hip_weight * Hcx if use_hip else Shx
 
-        center_series = Sx  # using shoulders only for now
-
-        # --- FIXED center at foot plant ---
-        center_fp = float(center_series[plant_i])
-
-        # direction gate (same as before)
+        center_fp = float(CenterX[plant_i])
         sign = +1.0 if handedness == "right" else (-1.0 if handedness == "left" else None)
 
-        # --- first qualifying inward X step after FP (toward fixed FP center) ---
-        start_i = plant_i + 1
-        for i in range(start_i, search_end_i + 1):
-            dx = Hx[i] - Hx[i-1]
+        debug_info = []
 
-            # distance to fixed FP center, not the moving torso center
-            cx_prev = abs(Hx[i-1] - center_fp)
-            cx_curr = abs(Hx[i]   - center_fp)
+        for i in range(plant_i + 1, search_end_i + 1):
+            dx = Hx[i] - Hx[i - 1]
+            cx_prev = abs(Hx[i - 1] - center_fp)
+            cx_curr = abs(Hx[i] - center_fp)
             toward_center = (cx_curr <= cx_prev - abs(min_center_step_units))
-
             dir_ok = (sign is None) or (sign * dx >= abs(min_dx_units))
+            frame_num = int(frames[i])
 
-            #print(
-              #  f"🧪 idx {i}: Hx={Hx[i]:.4f}, Cfp={center_fp:.4f}, dx={dx:.5f}, "
-              #  f"|Hx-Cfp|: {cx_prev:.4f}→{cx_curr:.4f} ({'↓' if toward_center else '↔/↑'}), "
-              #  f"dir_ok={dir_ok}"
-            # )
+            if debug:
+                print(
+                    f"🧪 Frame {frame_num} (idx {i}): "
+                    f"Hx={Hx[i]:.5f}, dx={dx:+.5f}, "
+                    f"|Hx-center_fp|: {cx_prev:.5f} → {cx_curr:.5f} "
+                    f"{'↓' if toward_center else '↔'}, "
+                    f"dir_ok={dir_ok}"
+                )
+
+            debug_info.append({
+                "frame": frame_num,
+                "index": i,
+                "hx": float(Hx[i]),
+                "dx": float(dx),
+                "cx_prev": float(cx_prev),
+                "cx_curr": float(cx_curr),
+                "toward_center": toward_center,
+                "dir_ok": dir_ok,
+                "passes": toward_center and dir_ok
+            })
 
             if toward_center and dir_ok:
-                frame = int(frames[i])
-                print(f"✅ Swing start (first inward X step to FP center) at frame {frame} (idx {i})")
-                return frame
+                if debug:
+                    print(f"✅ Swing start at frame {frame_num} (idx {i})")
+                return frame_num if not return_debug else (frame_num, debug_info)
 
-        print("🔻 No inward step toward FP center found within the capped window.")
-        return None
-    
+        if debug:
+            print("🔻 No inward hand step toward FP center found.")
+        return None if not return_debug else (None, debug_info)
+
+
+
     def _detect_contact_adaptive(self, data, swing_start, video_length, handedness: str):
         """Contact detection using elbow angle instead of arm length."""
 
@@ -948,135 +1107,6 @@ class RobustBaseballSwingAnalyzer:
                 min_frame = data['frames'][start_idx + i]
         
         return min_frame if min_movement < 0.02 else None
-    
-    def calculate_hip_shoulder_separation_robust(self, landmarks_over_time, swing_phases, handedness):
-        """Enhanced hip-shoulder separation calculation with improved accuracy."""
-        separation_data = []
-        is_lefty = handedness == "left"
-        
-        # Define landmarks based on handedness for consistent measurement
-        if is_lefty:
-            lead_shoulder_idx = mp_pose.PoseLandmark.RIGHT_SHOULDER.value
-            back_shoulder_idx = mp_pose.PoseLandmark.LEFT_SHOULDER.value
-            lead_hip_idx = mp_pose.PoseLandmark.RIGHT_HIP.value
-            back_hip_idx = mp_pose.PoseLandmark.LEFT_HIP.value
-        else:
-            lead_shoulder_idx = mp_pose.PoseLandmark.LEFT_SHOULDER.value
-            back_shoulder_idx = mp_pose.PoseLandmark.RIGHT_SHOULDER.value
-            lead_hip_idx = mp_pose.PoseLandmark.LEFT_HIP.value
-            back_hip_idx = mp_pose.PoseLandmark.RIGHT_HIP.value
-        
-        valid_frames = 0
-        for frame_idx, lm in enumerate(landmarks_over_time):
-            try:
-                # Get normalized positions using enhanced normalization
-                lead_shoulder_norm = self.normalize_landmark_position(lm[lead_shoulder_idx], lm)
-                back_shoulder_norm = self.normalize_landmark_position(lm[back_shoulder_idx], lm)
-                lead_hip_norm = self.normalize_landmark_position(lm[lead_hip_idx], lm)
-                back_hip_norm = self.normalize_landmark_position(lm[back_hip_idx], lm)
-                
-                if all([lead_shoulder_norm, back_shoulder_norm, lead_hip_norm, back_hip_norm]):
-                    # Calculate angles using normalized coordinates
-                    hip_angle = np.degrees(np.arctan2(
-                        back_hip_norm['y'] - lead_hip_norm['y'],
-                        back_hip_norm['x'] - lead_hip_norm['x']
-                    ))
-                    
-                    shoulder_angle = np.degrees(np.arctan2(
-                        back_shoulder_norm['y'] - lead_shoulder_norm['y'],
-                        back_shoulder_norm['x'] - lead_shoulder_norm['x']
-                    ))
-                    
-                    # Calculate separation with improved angle handling
-                    raw_separation = shoulder_angle - hip_angle
-                    # Normalize to -180 to 180 range
-                    separation = ((raw_separation + 180) % 360) - 180
-                    separation = abs(separation)  # Take absolute value for separation magnitude
-                    
-                    separation_data.append({
-                        'frame': frame_idx,
-                        'hip_angle': hip_angle,
-                        'shoulder_angle': shoulder_angle,
-                        'separation': separation,
-                        'body_scale': lead_shoulder_norm.get('scale', 1.0)
-                    })
-                    valid_frames += 1
-            except:
-                continue
-        
-        # Enhanced statistics calculation
-        if separation_data and valid_frames > len(landmarks_over_time) * 0.6:
-            separations = [d['separation'] for d in separation_data]
-            
-            # Use smoothed data for more stable max detection
-            if len(separations) > 5:
-                smoothed_separations = gaussian_filter1d(separations, sigma=1.5)
-                max_idx = np.argmax(smoothed_separations)
-                max_separation_data = separation_data[max_idx].copy()
-                max_separation_data['separation'] = smoothed_separations[max_idx]
-            else:
-                max_separation_data = max(separation_data, key=lambda x: x['separation'])
-            
-            # Calculate percentile-based average to reduce outlier influence
-            avg_separation = np.mean([s for s in separations if s <= np.percentile(separations, 85)])
-            
-            return {
-                'data': separation_data,
-                'max_separation': max_separation_data,
-                'average_separation': avg_separation,
-                'data_quality': valid_frames / len(landmarks_over_time)
-            }
-        
-        return {
-            'data': [],
-            'max_separation': None,
-            'average_separation': 0.0,
-            'data_quality': 0.0
-        }
-
-    def calculate_torso_lean_at_frame(self, landmarks, handedness) -> dict:
-        """
-        Calculates torso lean angle at a given frame using normalized mid-shoulder and mid-hip positions.
-        Positive angle = forward lean toward plate; negative = leaning back.
-        """
-        try:
-            # Midpoints between shoulders and hips
-            mid_shoulder = np.array([
-                (landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].x + landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x) / 2,
-                (landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].y + landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y) / 2
-            ])
-            mid_hip = np.array([
-                (landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].x + landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value].x) / 2,
-                (landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].y + landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value].y) / 2
-            ])
-
-            # Torso vector
-            torso_vector = mid_shoulder - mid_hip
-            vertical_ref = np.array([0, -1])  # Upward vertical
-
-            # Angle between torso vector and vertical
-            dot_product = np.dot(torso_vector, vertical_ref)
-            magnitudes = np.linalg.norm(torso_vector) * np.linalg.norm(vertical_ref)
-            angle_rad = np.arccos(np.clip(dot_product / magnitudes, -1.0, 1.0))
-            angle_deg = np.degrees(angle_rad)
-
-            # Determine sign based on forward or backward lean
-            forward_lean = (torso_vector[0] > 0) if handedness == "right" else (torso_vector[0] < 0)
-            if not forward_lean:
-                angle_deg *= -1
-
-            return {
-                "torso_lean_angle": angle_deg,
-                "forward_lean": forward_lean,
-                "torso_vector": torso_vector.tolist()
-            }
-
-        except Exception as e:
-            return {
-                "torso_lean_angle": None,
-                "error": str(e)
-            }
-
 
 # ---------------- Rotation fix ----------------
 
@@ -1249,40 +1279,6 @@ async def analyze_video_from_url(url: str):
     swing_phases = analyzer.detect_precise_swing_timing(landmarks_over_time, handedness)
 
     foot_plant_frame = swing_phases.get("foot_plant")
-    if foot_plant_frame is not None and 0 <= foot_plant_frame < len(landmarks_over_time):
-        try:
-            lm = landmarks_over_time[foot_plant_frame]
-            if handedness == "left":
-                lead_shoulder = lm[mp.PoseLandmark.RIGHT_SHOULDER.value]
-                back_shoulder = lm[mp.PoseLandmark.LEFT_SHOULDER.value]
-                lead_hip = lm[mp.PoseLandmark.RIGHT_HIP.value]
-                back_hip = lm[mp.PoseLandmark.LEFT_HIP.value]
-            else:
-                lead_shoulder = lm[mp.PoseLandmark.LEFT_SHOULDER.value]
-                back_shoulder = lm[mp.PoseLandmark.RIGHT_SHOULDER.value]
-                lead_hip = lm[mp.PoseLandmark.LEFT_HIP.value]
-                back_hip = lm[mp.PoseLandmark.RIGHT_HIP.value]
-
-            hip_angle = np.degrees(np.arctan2(back_hip.y - lead_hip.y, back_hip.x - lead_hip.x))
-            shoulder_angle = np.degrees(np.arctan2(back_shoulder.y - lead_shoulder.y, back_shoulder.x - lead_shoulder.x))
-            separation = abs(((shoulder_angle - hip_angle + 180) % 360) - 180)
-            print(f"📐 Separation at foot plant (Frame {foot_plant_frame}): {separation:.1f}°")
-
-            if separation < 20 or separation > 40:
-                feedback.append({
-                    "frame": foot_plant_frame,
-                    "issue": f"Hip-shoulder separation at foot plant is {separation:.1f}° (ideal: 20–40°)",
-                    "suggested_drill": "Improve separation timing and coil mechanics with rotational drills",
-                    "severity": "medium"
-                })
-
-            torso_lean_result = analyzer.calculate_torso_lean_at_frame(landmarks_over_time[foot_plant_frame], handedness)
-            angle = torso_lean_result.get("torso_lean_angle")
-            if angle is not None:
-                direction = "forward" if angle > 0 else "backward"
-                print(f"📏 Torso lean at foot plant (Frame {foot_plant_frame}): {angle:.1f}° ({direction})")
-        except Exception as e:
-            print(f"⚠️ Could not compute separation/torso lean at foot plant: {e}")
 
     print("⏱️ Swing phases detected:")
     for phase, frame in swing_phases.items():
@@ -1292,43 +1288,7 @@ async def analyze_video_from_url(url: str):
         else:
             print(f"   • {phase.replace('_',' ').title()}: Not detected")
 
-    separation_analysis = analyzer.calculate_hip_shoulder_separation_robust(
-        landmarks_over_time, swing_phases, handedness
-    )
-
-    if separation_analysis.get('max_separation') and separation_analysis.get('data_quality', 0) > 0.6:
-        max_sep = separation_analysis['max_separation']['separation']
-        avg_sep = separation_analysis['average_separation']
-        if max_sep < 15:
-            feedback.append({
-                "frame": separation_analysis['max_separation']['frame'],
-                "issue": f"Low hip-shoulder separation ({max_sep:.1f}°)",
-                "suggested_drill": "Practice coil drills and hip turn exercises to improve torque generation",
-                "severity": "high"
-            })
-        elif max_sep < 25:
-            feedback.append({
-                "frame": separation_analysis['max_separation']['frame'],
-                "issue": f"Below optimal hip-shoulder separation ({max_sep:.1f}°)",
-                "suggested_drill": "Work on timing hip initiation before shoulder turn",
-                "severity": "medium"
-            })
-        elif max_sep > 55:
-            feedback.append({
-                "frame": separation_analysis['max_separation']['frame'],
-                "issue": f"Very high separation ({max_sep:.1f}°) - check timing coordination",
-                "suggested_drill": "Practice smooth kinetic chain drills to improve timing",
-                "severity": "medium"
-            })
-        print(f"🔄 Hip-shoulder separation: Peak {max_sep:.1f}° (avg: {avg_sep:.1f}°)")
-    else:
-        feedback.append({
-            "frame": "overall",
-            "issue": "Hip-shoulder separation could not be measured reliably",
-            "suggested_drill": "Ensure clear side view of the swing with full body visible",
-            "severity": "low"
-        })
-
+    
     detected_phases = [p for p, f in swing_phases.items() if f is not None]
     if len(detected_phases) < 3:
         feedback.append({
@@ -1363,24 +1323,16 @@ async def analyze_video_from_url(url: str):
             "severity": "low"
         })
 
-    data_quality = separation_analysis.get('data_quality', 0.0)
-    if data_quality < 0.7:
-        feedback.append({
-            "frame": "overall",
-            "issue": f"Pose detection quality: {data_quality*100:.0f}%",
-            "suggested_drill": "Improve lighting and ensure full body is visible throughout swing",
-            "severity": "medium" if data_quality < 0.5 else "low"
-        })
+    #data_quality = separation_analysis.get('data_quality', 0.0)
+  
 
     biomarker_results = {
         "handedness": handedness_result,
         "swing_phases": swing_phases,
-        "separation_analysis": separation_analysis,
         "video_info": {
             "fps": fps,
             "frames_analyzed": len(landmarks_over_time),
-            "duration_seconds": duration,
-            "data_quality": data_quality
+            "duration_seconds": duration
         },
         "media": {
             "input_url": url,
@@ -1451,8 +1403,8 @@ async def generate_annotated_video(input_path: str, swing_phases: dict) -> str:
                 separation = abs(((shoulder_angle - hip_angle + 180) % 360) - 180)
 
                 cv2.putText(
-                    frame, f"Hip-Shoulder Sep: {separation:.1f}°",
-                    (30, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 0), 2
+                    frame, f"Hip-Shoulder Sep: {separation:.1f} degrees",
+                    (30, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 2
                 )
 
         # Add swing phase label if present
@@ -1460,12 +1412,12 @@ async def generate_annotated_video(input_path: str, swing_phases: dict) -> str:
             if f == frame_idx:
                 label = phase.replace("_", " ").title()
                 color = {
-                    "stride_start": (0, 255, 255),
-                    "foot_plant": (255, 165, 0),
-                    "swing_start": (0, 255, 0),
-                    "contact": (255, 0, 0),
-                    "follow_through": (255, 0, 255)
-                }.get(phase, (255, 255, 255))
+                    "stride_start": (0, 0, 0),
+                    "foot_plant": (0, 0, 0),
+                    "swing_start": (0, 0, 0),
+                    "contact": (0, 0, 0),
+                    "follow_through": (0, 0, 0)
+                }.get(phase, (0, 0, 0))
                 cv2.putText(frame, label, (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3)
                 cv2.putText(frame, label, (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 1)
 

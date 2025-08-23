@@ -1,366 +1,304 @@
-
+import { useEffect, useState } from 'react';
+import { router } from 'expo-router';
+import { supabase } from '@/lib/supabase';
+import {
+  Dimensions,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  View,
+  Alert,
+} from 'react-native';
 import { ThemedText } from '@/components/ThemedText';
-import { ThemedView } from '@/components/ThemedView';
-import { Image } from 'expo-image';
-import React, { useState } from 'react';
-import { Alert, ScrollView, StyleSheet, View } from 'react-native';
+import Animated, {
+  Easing,
+  useSharedValue,
+  useAnimatedStyle,
+  withRepeat,
+  withTiming,
+} from 'react-native-reanimated';
+import { LinearGradient } from 'expo-linear-gradient';
+import { Ionicons } from '@expo/vector-icons';
+
+const { width: SCREEN_WIDTH } = Dimensions.get('window');
 
 export default function ProfileScreen() {
-  const [user] = useState({
-    name: 'Alex Johnson',
-    email: 'alex.johnson@email.com',
-    position: 'Shortstop',
-    experience: 'High School Varsity',
-    joinDate: 'March 2024',
-    totalAnalyses: 24,
-    avgScore: 8.2,
-    improvementRate: '+12%'
-  });
+  const [user, setUser] = useState<any>(null);
+  const [userProfile, setUserProfile] = useState<any>(null);
+  const [loading, setLoading] = useState(true);
+  const [signingOut, setSigningOut] = useState(false);
 
-  const handleEditProfile = () => {
-    Alert.alert('Edit Profile', 'Profile editing would open here');
+  const glow = useSharedValue(0.4);
+
+  useEffect(() => {
+    fetchUserData();
+  }, []);
+
+  useEffect(() => {
+    if (!signingOut) {
+      glow.value = withRepeat(
+        withTiming(1, { duration: 1500, easing: Easing.inOut(Easing.ease) }),
+        -1,
+        true
+      );
+    } else {
+      glow.value = withTiming(0, { duration: 300 });
+    }
+  }, [signingOut]);
+
+  const glowStyle = useAnimatedStyle(() => ({
+    shadowOpacity: glow.value,
+  }));
+
+  const fetchUserData = async () => {
+    try {
+      const { data: sessionData } = await supabase.auth.getSession();
+      if (!sessionData.session) {
+        router.replace('/');
+        return;
+      }
+
+      const currentUser = sessionData.session.user;
+      setUser(currentUser);
+
+      // Fetch user profile data from your User table
+      const { data: profileData, error } = await supabase
+        .from('User')
+        .select('username, full_name')
+        .eq('email', currentUser.email)
+        .maybeSingle();
+
+      if (error) {
+        console.error('Error fetching profile:', error);
+      } else {
+        setUserProfile(profileData);
+      }
+    } catch (error) {
+      console.error('Error:', error);
+    } finally {
+      setLoading(false);
+    }
   };
 
-  const handleSettings = () => {
-    Alert.alert('Settings', 'Settings screen would open here');
+  const handleSignOut = async () => {
+    Alert.alert(
+      'Sign Out',
+      'Are you sure you want to sign out?',
+      [
+        {
+          text: 'Cancel',
+          style: 'cancel',
+        },
+        {
+          text: 'Sign Out',
+          style: 'destructive',
+          onPress: async () => {
+            setSigningOut(true);
+            const { error } = await supabase.auth.signOut();
+            if (error) {
+              console.error('Error signing out:', error);
+              Alert.alert('Error', 'Failed to sign out. Please try again.');
+              setSigningOut(false);
+            } else {
+              router.replace('/');
+            }
+          },
+        },
+      ]
+    );
   };
 
-  const handleContactCoach = () => {
-    Alert.alert('Contact Coach', 'Coach contact feature would open here');
-  };
+  if (loading) {
+    return (
+      <View style={styles.container}>
+        <View style={styles.bg} pointerEvents="none">
+          <LinearGradient
+            colors={['#0f1f18', '#123224', '#0f1f18']}
+            start={{ x: 0, y: 0 }}
+            end={{ x: 1, y: 1 }}
+            style={StyleSheet.absoluteFillObject}
+          />
+        </View>
+        <View style={styles.loadingContainer}>
+          <ThemedText style={styles.loadingText}>Loading profile...</ThemedText>
+        </View>
+      </View>
+    );
+  }
 
   return (
-    <ScrollView style={styles.container}>
-      <ThemedView style={styles.header}>
-        <ThemedText type="title">Profile</ThemedText>
-      </ThemedView>
-
-      <ThemedView style={styles.profileCard}>
-        <Image
-          source={require('@/assets/images/icon.png')}
-          style={styles.avatar}
+    <View style={styles.container}>
+      <View style={styles.bg} pointerEvents="none">
+        <LinearGradient
+          colors={['#0f1f18', '#123224', '#0f1f18']}
+          start={{ x: 0, y: 0 }}
+          end={{ x: 1, y: 1 }}
+          style={StyleSheet.absoluteFillObject}
         />
-        <ThemedText type="title" style={styles.userName}>{user.name}</ThemedText>
-        <ThemedText style={styles.userEmail}>{user.email}</ThemedText>
-        <ThemedText style={styles.userPosition}>{user.position} • {user.experience}</ThemedText>
-        
-        <View style={styles.editButton}>
-          <ThemedText
-            style={styles.editButtonText}
-            onPress={handleEditProfile}
-          >
-            Edit Profile
-          </ThemedText>
-        </View>
-      </ThemedView>
+      </View>
 
-      <ThemedView style={styles.statsSection}>
-        <ThemedText type="subtitle" style={styles.sectionTitle}>Your Stats</ThemedText>
-        
-        <View style={styles.statsGrid}>
-          <View style={styles.statItem}>
-            <ThemedText style={styles.statNumber}>{user.totalAnalyses}</ThemedText>
-            <ThemedText style={styles.statLabel}>Total Analyses</ThemedText>
+      <ScrollView
+        contentContainerStyle={styles.scrollContent}
+        showsVerticalScrollIndicator={false}
+      >
+        <View style={styles.card}>
+          <View style={styles.iconContainer}>
+            <Ionicons name="person-circle" size={80} color="#f44336" />
           </View>
           
-          <View style={styles.statItem}>
-            <ThemedText style={styles.statNumber}>{user.avgScore}</ThemedText>
-            <ThemedText style={styles.statLabel}>Average Score</ThemedText>
-          </View>
+          <ThemedText type="title" style={styles.title}>Profile</ThemedText>
           
-          <View style={styles.statItem}>
-            <ThemedText style={[styles.statNumber, { color: '#4CAF50' }]}>
-              {user.improvementRate}
-            </ThemedText>
-            <ThemedText style={styles.statLabel}>Improvement Rate</ThemedText>
-          </View>
-        </View>
-      </ThemedView>
+          <View style={styles.infoSection}>
+            <View style={styles.infoRow}>
+              <ThemedText style={styles.label}>Full Name</ThemedText>
+              <ThemedText style={styles.value}>
+                {userProfile?.full_name || 'Not provided'}
+              </ThemedText>
+            </View>
 
-      <ThemedView style={styles.achievementsSection}>
-        <ThemedText type="subtitle" style={styles.sectionTitle}>Achievements</ThemedText>
-        
-        <View style={styles.achievementsList}>
-          <View style={styles.achievement}>
-            <ThemedText style={styles.achievementIcon}>🏆</ThemedText>
-            <View style={styles.achievementInfo}>
-              <ThemedText type="defaultSemiBold">First Analysis</ThemedText>
-              <ThemedText style={styles.achievementDate}>Completed March 15, 2024</ThemedText>
+            <View style={styles.infoRow}>
+              <ThemedText style={styles.label}>Username</ThemedText>
+              <ThemedText style={styles.value}>
+                {userProfile?.username || 'N/A'}
+              </ThemedText>
             </View>
-          </View>
-          
-          <View style={styles.achievement}>
-            <ThemedText style={styles.achievementIcon}>🔥</ThemedText>
-            <View style={styles.achievementInfo}>
-              <ThemedText type="defaultSemiBold">7-Day Streak</ThemedText>
-              <ThemedText style={styles.achievementDate}>Consistent practice week</ThemedText>
-            </View>
-          </View>
-          
-          <View style={styles.achievement}>
-            <ThemedText style={styles.achievementIcon}>📈</ThemedText>
-            <View style={styles.achievementInfo}>
-              <ThemedText type="defaultSemiBold">Score Improvement</ThemedText>
-              <ThemedText style={styles.achievementDate}>+2.5 points this month</ThemedText>
-            </View>
-          </View>
-          
-          <View style={styles.achievement}>
-            <ThemedText style={styles.achievementIcon}>🎯</ThemedText>
-            <View style={styles.achievementInfo}>
-              <ThemedText type="defaultSemiBold">Perfect Form</ThemedText>
-              <ThemedText style={styles.achievementDate}>Scored 9.5+ on swing analysis</ThemedText>
-            </View>
-          </View>
-        </View>
-      </ThemedView>
 
-      <ThemedView style={styles.progressSection}>
-        <ThemedText type="subtitle" style={styles.sectionTitle}>Monthly Progress</ThemedText>
-        
-        <View style={styles.progressChart}>
-          <View style={styles.monthItem}>
-            <ThemedText style={styles.monthName}>Mar</ThemedText>
-            <View style={styles.progressBar}>
-              <View style={[styles.progressFill, { width: '70%' }]} />
+            <View style={styles.infoRow}>
+              <ThemedText style={styles.label}>Email</ThemedText>
+              <ThemedText style={styles.value}>
+                {user?.email || 'N/A'}
+              </ThemedText>
             </View>
-            <ThemedText style={styles.monthScore}>7.8</ThemedText>
           </View>
-          
-          <View style={styles.monthItem}>
-            <ThemedText style={styles.monthName}>Apr</ThemedText>
-            <View style={styles.progressBar}>
-              <View style={[styles.progressFill, { width: '82%' }]} />
-            </View>
-            <ThemedText style={styles.monthScore}>8.2</ThemedText>
-          </View>
-          
-          <View style={styles.monthItem}>
-            <ThemedText style={styles.monthName}>May</ThemedText>
-            <View style={styles.progressBar}>
-              <View style={[styles.progressFill, { width: '85%' }]} />
-            </View>
-            <ThemedText style={styles.monthScore}>8.5</ThemedText>
-          </View>
-        </View>
-      </ThemedView>
 
-      <ThemedView style={styles.actionsSection}>
-        <ThemedText type="subtitle" style={styles.sectionTitle}>Quick Actions</ThemedText>
-        
-        <View style={styles.actionsList}>
-          <View style={styles.actionItem}>
-            <ThemedText
-              style={styles.actionText}
-              onPress={handleContactCoach}
+          <Animated.View style={[styles.glowWrapper, glowStyle]}>
+            <Pressable
+              style={[styles.signOutButton, signingOut && styles.disabledButton]}
+              onPress={handleSignOut}
+              disabled={signingOut}
             >
-              👨‍🏫 Contact Coach
-            </ThemedText>
-          </View>
-          
-          <View style={styles.actionItem}>
-            <ThemedText
-              style={styles.actionText}
-              onPress={() => Alert.alert('Export', 'Export data feature')}
-            >
-              📊 Export Analysis Data
-            </ThemedText>
-          </View>
-          
-          <View style={styles.actionItem}>
-            <ThemedText
-              style={styles.actionText}
-              onPress={() => Alert.alert('Support', 'Help & support feature')}
-            >
-              🆘 Help & Support
-            </ThemedText>
-          </View>
-          
-          <View style={styles.actionItem}>
-            <ThemedText
-              style={styles.actionText}
-              onPress={handleSettings}
-            >
-              ⚙️ Settings
-            </ThemedText>
-          </View>
+              <Ionicons 
+                name="log-out-outline" 
+                size={20} 
+                color="#fff" 
+                style={styles.buttonIcon}
+              />
+              <ThemedText style={styles.buttonText}>
+                {signingOut ? 'Signing Out...' : 'Sign Out'}
+              </ThemedText>
+            </Pressable>
+          </Animated.View>
         </View>
-      </ThemedView>
-
-      <ThemedView style={styles.signOutSection}>
-        <View style={styles.signOutButton}>
-          <ThemedText style={styles.signOutText}>
-            Sign Out
-          </ThemedText>
-        </View>
-      </ThemedView>
-    </ScrollView>
+      </ScrollView>
+    </View>
   );
 }
 
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    padding: 20,
+    backgroundColor: '#082419',
   },
-  header: {
-    marginTop: 40,
-    marginBottom: 30,
-    alignItems: 'center',
+  bg: {
+    ...StyleSheet.absoluteFillObject,
+    zIndex: -1,
   },
-  profileCard: {
-    backgroundColor: '#f9f9f9',
-    padding: 30,
-    borderRadius: 15,
-    alignItems: 'center',
-    marginBottom: 30,
-  },
-  avatar: {
-    width: 80,
-    height: 80,
-    borderRadius: 40,
-    marginBottom: 15,
-  },
-  userName: {
-    marginBottom: 5,
-  },
-  userEmail: {
-    opacity: 0.7,
-    marginBottom: 5,
-  },
-  userPosition: {
-    opacity: 0.6,
-    fontSize: 14,
-    marginBottom: 20,
-  },
-  editButton: {
-    backgroundColor: '#007AFF',
-    paddingHorizontal: 30,
-    paddingVertical: 12,
-    borderRadius: 25,
-  },
-  editButtonText: {
-    color: 'white',
-    fontWeight: 'bold',
-  },
-  statsSection: {
-    marginBottom: 30,
-  },
-  sectionTitle: {
-    marginBottom: 15,
-  },
-  statsGrid: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    gap: 10,
-  },
-  statItem: {
-    backgroundColor: '#f9f9f9',
-    padding: 20,
-    borderRadius: 12,
+  loadingContainer: {
     flex: 1,
+    justifyContent: 'center',
     alignItems: 'center',
   },
-  statNumber: {
-    fontSize: 24,
-    fontWeight: 'bold',
-    color: '#007AFF',
-    marginBottom: 5,
-  },
-  statLabel: {
-    fontSize: 12,
-    opacity: 0.7,
-    textAlign: 'center',
-  },
-  achievementsSection: {
-    marginBottom: 30,
-  },
-  achievementsList: {
-    gap: 15,
-  },
-  achievement: {
-    flexDirection: 'row',
-    backgroundColor: '#f9f9f9',
-    padding: 15,
-    borderRadius: 12,
-    alignItems: 'center',
-  },
-  achievementIcon: {
-    fontSize: 30,
-    marginRight: 15,
-  },
-  achievementInfo: {
-    flex: 1,
-  },
-  achievementDate: {
-    opacity: 0.6,
-    fontSize: 12,
-    marginTop: 4,
-  },
-  progressSection: {
-    marginBottom: 30,
-  },
-  progressChart: {
-    backgroundColor: '#f9f9f9',
-    padding: 20,
-    borderRadius: 12,
-  },
-  monthItem: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    marginBottom: 15,
-  },
-  monthName: {
-    width: 40,
-    fontSize: 14,
-    fontWeight: 'bold',
-  },
-  progressBar: {
-    flex: 1,
-    height: 8,
-    backgroundColor: '#e0e0e0',
-    borderRadius: 4,
-    marginHorizontal: 15,
-  },
-  progressFill: {
-    height: '100%',
-    backgroundColor: '#007AFF',
-    borderRadius: 4,
-  },
-  monthScore: {
-    width: 40,
-    textAlign: 'right',
-    fontWeight: 'bold',
-    color: '#007AFF',
-  },
-  actionsSection: {
-    marginBottom: 30,
-  },
-  actionsList: {
-    gap: 12,
-  },
-  actionItem: {
-    backgroundColor: '#f9f9f9',
-    padding: 18,
-    borderRadius: 12,
-  },
-  actionText: {
+  loadingText: {
+    color: '#d5ead6',
     fontSize: 16,
-    color: '#333',
+    fontWeight: '500',
   },
-  signOutSection: {
-    marginBottom: 30,
+  scrollContent: {
+    paddingBottom: 40,
+    paddingHorizontal: 24,
+    flexGrow: 1,
+    justifyContent: 'center',
+  },
+  card: {
+    width: SCREEN_WIDTH < 400 ? '100%' : 360,
+    backgroundColor: '#1a2e25',
+    borderRadius: 20,
+    padding: 24,
+    borderWidth: 2,
+    borderColor: '#ffffff33',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 10 },
+    shadowOpacity: 0.2,
+    shadowRadius: 20,
+    elevation: 6,
+    alignSelf: 'center',
+  },
+  iconContainer: {
     alignItems: 'center',
+    marginBottom: 16,
+  },
+  title: {
+    fontSize: 26,
+    fontWeight: '900',
+    color: '#ffffff',
+    letterSpacing: 2,
+    textAlign: 'center',
+    marginBottom: 24,
+    textShadowColor: '#f44336',
+    textShadowOffset: { width: 0, height: 0 },
+    textShadowRadius: 10,
+  },
+  infoSection: {
+    marginBottom: 32,
+  },
+  infoRow: {
+    marginBottom: 16,
+    paddingBottom: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: '#ffffff22',
+  },
+  label: {
+    color: '#e0f2f1',
+    fontWeight: '600',
+    fontSize: 15,
+    marginBottom: 6,
+  },
+  value: {
+    color: '#d5ead6',
+    fontSize: 16,
+    fontWeight: '500',
   },
   signOutButton: {
-    backgroundColor: '#ff4444',
-    paddingHorizontal: 40,
-    paddingVertical: 15,
-    borderRadius: 25,
+    backgroundColor: '#f44336',
+    paddingVertical: 16,
+    borderRadius: 16,
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexDirection: 'row',
+    borderWidth: 2,
+    borderColor: '#ffffff88',
+    shadowColor: '#f44336',
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.3,
+    shadowRadius: 12,
+    elevation: 6,
   },
-  signOutText: {
-    color: 'white',
-    fontWeight: 'bold',
+  disabledButton: {
+    opacity: 0.65,
+  },
+  buttonIcon: {
+    marginRight: 8,
+  },
+  buttonText: {
+    color: '#fff',
     fontSize: 16,
+    fontWeight: '900',
+    letterSpacing: 1,
+    textTransform: 'uppercase',
+  },
+  glowWrapper: {
+    shadowColor: '#ffffff',
+    shadowOffset: { width: 0, height: 0 },
+    shadowRadius: 18,
   },
 });

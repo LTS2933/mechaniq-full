@@ -523,7 +523,7 @@ export default function UploadScreen() {
                 </View>
 
                 <Image
-                  source={require('../../assets/swingsideview.jpg')}
+                  source={require('../../assets/Untitled 233tt.gif')}
                   style={{ width: '100%', height: 120, resizeMode: 'contain', borderRadius: 8, marginBottom: 16 }}
                 />
 
@@ -531,14 +531,14 @@ export default function UploadScreen() {
                 <View style={styles.tip}>
                   <ThemedText style={styles.tipEmoji}>🎯</ThemedText>
                   <ThemedText style={styles.tipText}>
-                    Position 10-15 ft away, full body visible
+                    Position 25-30 ft away, full body visible at all times
                   </ThemedText>
                 </View>
 
                 <View style={styles.tip}>
                   <ThemedText style={styles.tipEmoji}>💡</ThemedText>
                   <ThemedText style={styles.tipText}>
-                    Good lighting, clear background
+                    Good lighting, high quality, few/no shadows 
                   </ThemedText>
                 </View>
 
