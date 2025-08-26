@@ -147,16 +147,18 @@ class RobustBaseballSwingAnalyzer:
                 # Debug output for first few valid frames
                 if valid_frames <= 5:
                     face_direction = "LEFT" if direction_score > 0 else "RIGHT"
+                    """
                     print(f"   Frame {i}: score={direction_score:.4f} → facing {face_direction}")
                     print(f"      Eye component: {eye_component:.4f} (R-eye dist: {dist_nose_to_reye:.3f}, L-eye dist: {dist_nose_to_leye:.3f})")
                     print(f"      Ear component: {ear_component:.4f} (R-ear dist: {dist_nose_to_rear:.3f}, L-ear dist: {dist_nose_to_lear:.3f})")
+                    """
 
             except Exception as e:
                 if i < 10:  # Debug first 10 frames
                     print(f"   Frame {i}: Error processing landmarks - {e}")
                 continue
 
-        print(f"📈 Processing results: {valid_frames} valid frames, {low_visibility_frames} low visibility frames")
+        #print(f"📈 Processing results: {valid_frames} valid frames, {low_visibility_frames} low visibility frames")
 
         if len(direction_scores) < 5:
             print("❌ Too few valid face frames for reliable detection")
@@ -168,12 +170,14 @@ class RobustBaseballSwingAnalyzer:
         positive_scores = sum(1 for s in direction_scores if s > 0)
         negative_scores = sum(1 for s in direction_scores if s < 0)
         
+        """
         print(f"📊 Score Analysis:")
         print(f"   Average score: {avg_score:.4f}")
         print(f"   Score std dev: {score_std:.4f}")
         print(f"   Positive scores (facing left): {positive_scores}/{len(direction_scores)} ({positive_scores/len(direction_scores)*100:.1f}%)")
         print(f"   Negative scores (facing right): {negative_scores}/{len(direction_scores)} ({negative_scores/len(direction_scores)*100:.1f}%)")
         print(f"   Score range: [{min(direction_scores):.4f}, {max(direction_scores):.4f}]")
+        """
 
         if abs(avg_score) < 0.01:
             print("❌ Face direction too ambiguous (average score near zero)")
@@ -225,10 +229,13 @@ class RobustBaseballSwingAnalyzer:
                     else:
                         print(f"📊 Keeping face detection result due to higher confidence")
         
+        """
         print(f"✅ {confidence_level} CONFIDENCE Detection:")
         print(f"   {reasoning}")
         print(f"   Consistency: {consistency:.1%} of frames agree")
         print(f"   Final confidence score: {confidence}")
+
+        """
 
         return {
             "handedness": handedness,
@@ -252,7 +259,7 @@ class RobustBaseballSwingAnalyzer:
         Left-handed: hands closer to left shoulder
         Right-handed: hands closer to right shoulder
         """
-        print("🤲 Starting hand-shoulder proximity analysis...")
+        #print("🤲 Starting hand-shoulder proximity analysis...")
         
         valid_measurements = []
         
@@ -315,11 +322,13 @@ class RobustBaseballSwingAnalyzer:
         right_count = sum(1 for score in valid_measurements if score > 0)
         consistency = max(left_count, right_count) / len(valid_measurements)
         
+        """
         print(f"📊 Hand-Shoulder Analysis:")
         print(f"   Average proximity score: {avg_proximity:.4f}")
         print(f"   Closer to left shoulder: {left_count}/{len(valid_measurements)} ({left_count/len(valid_measurements)*100:.1f}%)")
         print(f"   Closer to right shoulder: {right_count}/{len(valid_measurements)} ({right_count/len(valid_measurements)*100:.1f}%)")
         print(f"   Consistency: {consistency:.1%}")
+        """
         
         if abs(avg_proximity) < 0.01:
             print("❌ Hand position too ambiguous (equal distance to both shoulders)")
@@ -792,6 +801,8 @@ class RobustBaseballSwingAnalyzer:
 
         # Threshold for "almost straight" arm
         ANGLE_THRESH = 160.0
+        SECONDARY_ANGLE_THRESH = 145.0
+
 
         # Hands-ahead-of-face check
         hx = 0.5 * (np.asarray(data['lead_wrist_x'], float) + np.asarray(data['back_wrist_x'], float))
@@ -800,7 +811,7 @@ class RobustBaseballSwingAnalyzer:
         have_face = (len(face_x) == len(hx_s))
         face_x_s = _smooth1d(face_x, 0.8) if have_face else face_x
         sign = +1.0 if handedness == 'right' else (-1.0 if handedness == 'left' else None)
-        margin = 0.01
+        margin = 0.065
 
         def hands_ahead(idx: int) -> bool:
             if not (have_face and sign is not None):
@@ -810,25 +821,51 @@ class RobustBaseballSwingAnalyzer:
             diff = sign * (hx_s[idx] - face_x_s[idx])
             return diff >= margin
 
+        bex = _smooth1d(data['back_elbow_x'], 0.6)
+
+        def back_elbow_ahead(idx: int) -> bool:
+            if not (have_face and sign is not None):
+                return False
+            if not (np.isfinite(bex[idx]) and np.isfinite(face_x_s[idx])):
+                return False
+            diff = sign * (bex[idx] - face_x_s[idx])
+            return diff >= margin
+
+
         # --- DEBUG print ---
         """
         print("\n🛠 DEBUG: Frame-by-frame contact search window")
-        print(" idx | frame | elbow_angle | near_full? | hands_ahead?")
-        print("-----|-------|-------------|------------|--------------")
+        print(" idx | frame | elbow_angle | near_full? | hands_ahead? | elbow_ahead? | elbow_ahead_dist")
+        print("-----|-------|-------------|------------|--------------|--------------|------------------")
         for idx in range(start_idx, end_idx + 1):
             angle = elbow_angles[idx]
             nf = np.isfinite(angle) and angle >= ANGLE_THRESH
             ahead = hands_ahead(idx)
-            print(f"{idx:4d} | {int(data['frames'][idx]):5d} | {angle:11.2f} | {str(nf):>10} | {str(ahead):>12}")
+
+            # Compute elbow diff
+            if have_face and sign is not None and np.isfinite(bex[idx]) and np.isfinite(face_x_s[idx]):
+                elbow_diff = sign * (bex[idx] - face_x_s[idx])
+                elbow_ahead = elbow_diff >= margin
+            else:
+                elbow_diff = float('nan')
+                elbow_ahead = False
+
+            print(f"{idx:4d} | {int(data['frames'][idx]):5d} | {angle:11.2f} | {str(nf):>10} | {str(ahead):>12} | {str(elbow_ahead):>12} | {elbow_diff:16.4f}")
         """
+
+        
 
         # === Selection logic ===
         # Step 1: earliest frame with straight arm & hands ahead
         earliest_idx = None
         for idx in range(start_idx, end_idx + 1):
-            if np.isfinite(elbow_angles[idx]) and elbow_angles[idx] >= ANGLE_THRESH and hands_ahead(idx):
-                earliest_idx = idx
-                break
+            if np.isfinite(elbow_angles[idx]):
+                angle = elbow_angles[idx]
+                if (angle >= ANGLE_THRESH and hands_ahead(idx)) or \
+                (angle >= SECONDARY_ANGLE_THRESH and back_elbow_ahead(idx)):
+                    earliest_idx = idx
+                    break
+
 
         if earliest_idx is not None:
             print(f"🎯 contact: earliest straight-arm & ahead-of-face at idx={earliest_idx} "
@@ -846,151 +883,6 @@ class RobustBaseballSwingAnalyzer:
         print("🚫 No valid elbow angles for contact detection")
         return None
 
-
-
-
-    
-    def _find_maximum_hand_separation_adaptive(self, data, start_idx, search_window):
-        """Enhanced maximum hand separation detection."""
-        max_separation = 0
-        max_frame = None
-        
-        # Use smoothed data for more stable detection
-        lead_wrist_x_smooth = gaussian_filter1d(data['lead_wrist_x'][start_idx:start_idx+search_window], sigma=0.8)
-        lead_wrist_y_smooth = gaussian_filter1d(data['lead_wrist_y'][start_idx:start_idx+search_window], sigma=0.8)
-        back_wrist_x_smooth = gaussian_filter1d(data['back_wrist_x'][start_idx:start_idx+search_window], sigma=0.8)
-        back_wrist_y_smooth = gaussian_filter1d(data['back_wrist_y'][start_idx:start_idx+search_window], sigma=0.8)
-        
-        for i in range(len(lead_wrist_x_smooth)):
-            separation = np.sqrt(
-                (lead_wrist_x_smooth[i] - back_wrist_x_smooth[i])**2 +
-                (lead_wrist_y_smooth[i] - back_wrist_y_smooth[i])**2
-            )
-            
-            if separation > max_separation:
-                max_separation = separation
-                max_frame = data['frames'][start_idx + i]
-        
-        return max_frame
-    
-    def _find_maximum_bat_speed_adaptive(self, data, start_idx, search_window):
-        """Enhanced maximum bat speed detection."""
-        max_speed = 0
-        max_frame = None
-        
-        # Smooth hand positions
-        smoothed_x = gaussian_filter1d(data['lead_wrist_x'][start_idx:start_idx+search_window], sigma=0.6)
-        smoothed_y = gaussian_filter1d(data['lead_wrist_y'][start_idx:start_idx+search_window], sigma=0.6)
-        
-        for i in range(3, len(smoothed_x) - 3):
-            dx = smoothed_x[i+3] - smoothed_x[i-3]
-            dy = smoothed_y[i+3] - smoothed_y[i-3]
-            speed = np.sqrt(dx**2 + dy**2) / 6  # 6-frame window
-            
-            if speed > max_speed:
-                max_speed = speed
-                max_frame = data['frames'][start_idx + i]
-        
-        return max_frame
-    
-    def _find_lead_arm_extension_max_adaptive(self, data, start_idx, search_window):
-        """Enhanced lead arm extension detection."""
-        max_extension = 0
-        max_frame = None
-        
-        # Smooth positions for stable measurement
-        lead_shoulder_x = gaussian_filter1d(data['lead_shoulder_x'][start_idx:start_idx+search_window], sigma=0.8)
-        lead_shoulder_y = gaussian_filter1d(data['lead_shoulder_y'][start_idx:start_idx+search_window], sigma=0.8)
-        lead_wrist_x = gaussian_filter1d(data['lead_wrist_x'][start_idx:start_idx+search_window], sigma=0.8)
-        lead_wrist_y = gaussian_filter1d(data['lead_wrist_y'][start_idx:start_idx+search_window], sigma=0.8)
-        
-        for i in range(len(lead_shoulder_x)):
-            extension = np.sqrt(
-                (lead_wrist_x[i] - lead_shoulder_x[i])**2 +
-                (lead_wrist_y[i] - lead_shoulder_y[i])**2
-            )
-            
-            if extension > max_extension:
-                max_extension = extension
-                max_frame = data['frames'][start_idx + i]
-        
-        return max_frame
-    
-    def _find_kinetic_sequence_peak_adaptive(self, data, start_idx, search_window):
-        """Enhanced kinetic sequence peak detection."""
-        max_sequence_value = 0
-        max_frame = None
-        
-        # Calculate combined hip and shoulder velocities
-        hip_angles = []
-        shoulder_angles = []
-        
-        for i in range(start_idx, start_idx + search_window):
-            if i >= len(data['lead_hip_x']):
-                break
-                
-            hip_angle = np.arctan2(
-                data['back_hip_y'][i] - data['lead_hip_y'][i],
-                data['back_hip_x'][i] - data['lead_hip_x'][i]
-            )
-            shoulder_angle = np.arctan2(
-                data['back_shoulder_y'][i] - data['lead_shoulder_y'][i],
-                data['back_shoulder_x'][i] - data['lead_shoulder_x'][i]
-            )
-            
-            hip_angles.append(hip_angle)
-            shoulder_angles.append(shoulder_angle)
-        
-        if len(hip_angles) < 6:
-            return None
-        
-        # Smooth angles
-        hip_smooth = gaussian_filter1d(hip_angles, sigma=1.0)
-        shoulder_smooth = gaussian_filter1d(shoulder_angles, sigma=1.0)
-        
-        for i in range(3, len(hip_smooth) - 3):
-            hip_velocity = abs((hip_smooth[i+2] - hip_smooth[i-2]) / 4)
-            shoulder_velocity = abs((shoulder_smooth[i+2] - shoulder_smooth[i-2]) / 4)
-            
-            # Combined sequence value (both rotating fast)
-            sequence_value = hip_velocity * 0.6 + shoulder_velocity * 0.4
-            
-            if sequence_value > max_sequence_value:
-                max_sequence_value = sequence_value
-                max_frame = data['frames'][start_idx + i]
-        
-        return max_frame
-    
-    def _find_weight_transfer_completion_adaptive(self, data, start_idx, search_window):
-        """Detect completion of weight transfer to front leg."""
-        # Look for stabilization of lead leg position
-        lead_knee_x = data['lead_knee_x'][start_idx:start_idx+search_window]
-        lead_ankle_x = data['lead_ankle_x'][start_idx:start_idx+search_window]
-        
-        if len(lead_knee_x) < 6:
-            return None
-        
-        # Smooth data
-        knee_smooth = gaussian_filter1d(lead_knee_x, sigma=1.0)
-        ankle_smooth = gaussian_filter1d(lead_ankle_x, sigma=1.0)
-        
-        min_movement = float('inf')
-        min_frame = None
-        
-        for i in range(3, len(knee_smooth) - 3):
-            # Calculate movement in lead leg
-            knee_movement = abs((knee_smooth[i+2] - knee_smooth[i-2]) / 4)
-            ankle_movement = abs((ankle_smooth[i+2] - ankle_smooth[i-2]) / 4)
-            
-            total_movement = knee_movement + ankle_movement
-            
-            # Weight transfer completion = minimal lead leg movement
-            if total_movement < min_movement:
-                min_movement = total_movement
-                min_frame = data['frames'][start_idx + i]
-        
-        # Only return if movement is sufficiently low
-        return min_frame if min_movement < 0.03 else None
     
     def _detect_follow_through_adaptive(self, data, contact, video_length):
         """Enhanced follow-through detection with adaptive parameters."""
@@ -1107,6 +999,68 @@ class RobustBaseballSwingAnalyzer:
                 min_frame = data['frames'][start_idx + i]
         
         return min_frame if min_movement < 0.02 else None
+
+
+def calculate_attack_angle_from_landmarks(landmarks, handedness: str) -> float | None:
+    """
+    Estimate attack angle proxy using shoulder tilt.
+    
+    Returns a proxy value that mimics attack angle ranges:
+    - Positive values (4-16°): Upward swing (good for line drives)
+    - Zero (0°): Level swing
+    - Negative values (-5° to -15°): Downward swing (chopping)
+    
+    Target range for line drives: 6-14° (similar to actual attack angle)
+    
+    Args:
+        landmarks: MediaPipe pose landmarks
+        handedness: "right" or "left" 
+        
+    Returns:
+        Attack angle proxy in degrees, or None if calculation fails
+    """
+    try:
+        if handedness == "right":
+            front_shoulder = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value]
+            rear_shoulder = landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value]
+        elif handedness == "left":
+            front_shoulder = landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value]
+            rear_shoulder = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value]
+        else:
+            return None
+
+        # Simple logic: compare Y coordinates
+        # In CV coordinates: higher Y = lower in image
+        # If rear shoulder Y > front shoulder Y → rear shoulder is lower → upward swing
+        dy = rear_shoulder.y - front_shoulder.y
+        dx = rear_shoulder.x - front_shoulder.x
+        
+        print(f"DEBUG: dy={dy:.3f} (positive = rear shoulder lower)")
+        print(f"DEBUG: dx={dx:.3f}")
+        
+        # Calculate angle using slope
+        if abs(dx) < 0.001:  # Avoid division by zero
+            angle_proxy = 0
+        else:
+            slope = dy / dx
+            angle_deg = np.degrees(np.arctan(slope))
+            print(f"DEBUG: slope={slope:.3f}, angle_deg={angle_deg:.1f}")
+            
+            # The sign of the angle depends on both dy and dx
+            # We want: rear shoulder lower (dy > 0) = upward swing = positive proxy
+            if dy > 0:  # Rear shoulder lower = upward swing
+                angle_proxy = abs(angle_deg) * 0.2  # Always positive
+            else:  # Rear shoulder higher = downward swing  
+                angle_proxy = -abs(angle_deg) * 0.2  # Always negative
+        
+        print(f"DEBUG: Final attack angle proxy: {angle_proxy:.1f}°")
+        
+        return round(angle_proxy, 1)
+        
+    except Exception as e:
+        print(f"⚠️ Error calculating attack angle proxy: {e}")
+        return None
+
 
 # ---------------- Rotation fix ----------------
 
@@ -1346,7 +1300,7 @@ async def analyze_video_from_url(url: str):
 
 # ---------------- Annotated video generator (works with upright video) ----------------
 
-async def generate_annotated_video(input_path: str, swing_phases: dict) -> str:
+async def generate_annotated_video(input_path: str, swing_phases: dict, handedness) -> str:
     """
     Generate an annotated upright video saved as 'annotated_output.mp4'.
     Handles rotation correction if needed.
@@ -1406,6 +1360,22 @@ async def generate_annotated_video(input_path: str, swing_phases: dict) -> str:
                     frame, f"Hip-Shoulder Sep: {separation:.1f} degrees",
                     (30, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 2
                 )
+
+        if swing_phases.get("contact") == frame_idx:
+                # Calculate attack angle
+                attack_angle = calculate_attack_angle_from_landmarks(results.pose_landmarks.landmark, handedness)
+                
+                if attack_angle is not None:
+                    cv2.putText(
+                        frame,
+                        f"Attack Angle: {attack_angle:.1f} degrees",
+                        (30, 130),  # Y-position below other annotations
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.9,
+                        (0, 0, 0),
+                        2
+                    )
+
 
         # Add swing phase label if present
         for phase, f in swing_phases.items():

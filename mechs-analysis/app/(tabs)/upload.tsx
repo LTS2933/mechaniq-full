@@ -510,7 +510,7 @@ export default function UploadScreen() {
           <View style={styles.section}>
             <View style={styles.futuristicPanel}>
               <ThemedText type="subtitle" style={[styles.sectionTitle, { textAlign: 'center' }]}>
-                Setup Protocol
+                Setup For Best Results
               </ThemedText>
 
               <View style={styles.tipsContainer}>
@@ -518,7 +518,7 @@ export default function UploadScreen() {
                 <View style={[styles.tip, { flexDirection: 'row', alignItems: 'center', marginBottom: 16 }]}>
                   <ThemedText style={[styles.tipEmoji, { fontSize: 22, marginRight: 8 }]}>📹</ThemedText>
                   <ThemedText style={[styles.tipText, { flex: 1 }]} numberOfLines={2}>
-                    Film swing from the open side
+                    Film swing from open side ↙
                   </ThemedText>
                 </View>
 
@@ -538,14 +538,14 @@ export default function UploadScreen() {
                 <View style={styles.tip}>
                   <ThemedText style={styles.tipEmoji}>💡</ThemedText>
                   <ThemedText style={styles.tipText}>
-                    Good lighting, high quality, few/no shadows 
+                    Good lighting, high quality & 30 fps, few/no shadows
                   </ThemedText>
                 </View>
 
                 <View style={styles.tip}>
                   <ThemedText style={styles.tipEmoji}>⏱️</ThemedText>
                   <ThemedText style={styles.tipText}>
-                    Only capture the swing — no extra footage before or after
+                    Just capture the swing — no extra footage before or after
                   </ThemedText>
                 </View>
 
