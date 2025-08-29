@@ -11,6 +11,7 @@ import json
 from typing import Dict, List, Tuple, Optional
 import ffmpeg
 import uuid
+from mediapipe.framework.formats import landmark_pb2
 
 # NEW: supabase-py client
 from supabase import create_client, Client
@@ -710,6 +711,7 @@ class RobustBaseballSwingAnalyzer:
             dir_ok = (sign is None) or (sign * dx >= abs(min_dx_units))
             frame_num = int(frames[i])
 
+            """
             if debug:
                 print(
                     f"🧪 Frame {frame_num} (idx {i}): "
@@ -718,6 +720,7 @@ class RobustBaseballSwingAnalyzer:
                     f"{'↓' if toward_center else '↔'}, "
                     f"dir_ok={dir_ok}"
                 )
+            """
 
             debug_info.append({
                 "frame": frame_num,
@@ -736,8 +739,6 @@ class RobustBaseballSwingAnalyzer:
                     print(f"✅ Swing start at frame {frame_num} (idx {i})")
                 return frame_num if not return_debug else (frame_num, debug_info)
 
-        if debug:
-            print("🔻 No inward hand step toward FP center found.")
         return None if not return_debug else (None, debug_info)
 
 
@@ -1000,6 +1001,105 @@ class RobustBaseballSwingAnalyzer:
         
         return min_frame if min_movement < 0.02 else None
 
+    def calculate_hand_speed_metrics_mph(
+        self,
+        landmarks_by_frame: dict[int, List],
+        swing_start: int,
+        contact: int,
+        fps: float,
+        assumed_shoulder_width_m: float = 0.40
+    ) -> dict:
+        """
+        Calculates peak and average hand speed in MPH between swing start and contact.
+        Uses wrist midpoint displacement, normalized by median shoulder width.
+        Returns:
+            {
+                "peak_hand_speed_mph": float,
+                "average_hand_speed_mph": float,
+                "frame_of_peak_speed": int,
+                "hand_speeds_by_frame": dict[int, float]
+            }
+        """
+        if not swing_start or not contact or contact <= swing_start:
+            print("🚫 Invalid frame range for hand speed calculation.")
+            return {}
+
+        wrist_positions = {}
+        shoulder_widths = []
+
+        # Step 1: Gather wrist midpoints and shoulder widths
+        for frame in range(swing_start, contact + 1):
+            if frame not in landmarks_by_frame:
+                continue
+
+            try:
+                landmarks = landmarks_by_frame[frame]
+                lw = landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value]
+                rw = landmarks[mp_pose.PoseLandmark.RIGHT_WRIST.value]
+                ls = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value]
+                rs = landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value]
+
+                # Wrist midpoint
+                mx = (lw.x + rw.x) / 2
+                my = (lw.y + rw.y) / 2
+                wrist_positions[frame] = (mx, my)
+
+                # Shoulder width (used later for scale)
+                shoulder_width = np.sqrt((ls.x - rs.x)**2 + (ls.y - rs.y)**2)
+                if shoulder_width > 0.01:  # filter out garbage values
+                    shoulder_widths.append(shoulder_width)
+            except:
+                continue
+
+        if len(wrist_positions) < 2 or not shoulder_widths:
+            print("🚫 Not enough valid pose frames.")
+            return {}
+
+        median_shoulder_width = np.median(shoulder_widths)
+        meters_per_unit = assumed_shoulder_width_m / median_shoulder_width
+
+        # Step 2: Calculate speed between frames
+        prev_frame = None
+        prev_pos = None
+        speeds_mph = {}
+        total_speed = 0
+        peak_speed = 0
+        peak_frame = swing_start
+        count = 0
+
+        for frame in sorted(wrist_positions.keys()):
+            pos = wrist_positions[frame]
+            if prev_pos:
+                dx = pos[0] - prev_pos[0]
+                dy = pos[1] - prev_pos[1]
+                dist_units = np.sqrt(dx**2 + dy**2)
+
+                dist_m = dist_units * meters_per_unit
+                speed_mps = dist_m * fps
+                speed_mph = speed_mps * 2.23694  # m/s to MPH
+
+                speeds_mph[frame] = round(speed_mph, 2)
+                total_speed += speed_mph
+                count += 1
+
+                if speed_mph > peak_speed:
+                    peak_speed = speed_mph
+                    peak_frame = frame
+
+            prev_pos = pos
+            prev_frame = frame
+
+        average_speed = total_speed / count if count else 0
+
+        return {
+            "peak_hand_speed_mph": round(peak_speed, 2),
+            "average_hand_speed_mph": round(average_speed, 2),
+            "frame_of_peak_speed": peak_frame,
+            "hand_speeds_by_frame": speeds_mph
+        }
+
+
+
 
 def calculate_attack_angle_from_landmarks(landmarks, handedness: str) -> float | None:
     """
@@ -1035,8 +1135,6 @@ def calculate_attack_angle_from_landmarks(landmarks, handedness: str) -> float |
         dy = rear_shoulder.y - front_shoulder.y
         dx = rear_shoulder.x - front_shoulder.x
         
-        print(f"DEBUG: dy={dy:.3f} (positive = rear shoulder lower)")
-        print(f"DEBUG: dx={dx:.3f}")
         
         # Calculate angle using slope
         if abs(dx) < 0.001:  # Avoid division by zero
@@ -1044,7 +1142,7 @@ def calculate_attack_angle_from_landmarks(landmarks, handedness: str) -> float |
         else:
             slope = dy / dx
             angle_deg = np.degrees(np.arctan(slope))
-            print(f"DEBUG: slope={slope:.3f}, angle_deg={angle_deg:.1f}")
+            #print(f"DEBUG: slope={slope:.3f}, angle_deg={angle_deg:.1f}")
             
             # The sign of the angle depends on both dy and dx
             # We want: rear shoulder lower (dy > 0) = upward swing = positive proxy
@@ -1192,23 +1290,24 @@ async def analyze_video_from_url(url: str):
     # 1) Download original
     original_path = await _download_temp(url)
 
-    # 2) Normalize rotation (always gives us an upright copy)
+    # 2) Normalize rotation
     fixed_path, was_rotated, rotation_deg = fix_rotation_if_needed(original_path)
 
-    # 3) Analyze *only the local upright copy*
+    # 3) Analyze upright copy
     cap = cv2.VideoCapture(fixed_path)
     if not cap.isOpened():
         return [{"message": "Failed to read video file"}], {}
 
     analyzer = RobustBaseballSwingAnalyzer()
 
-    landmarks_over_time = []
+    landmarks_by_frame = {}
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    duration = (total_frames / fps) if fps > 0 else 0.0
+    duration = total_frames / fps if fps > 0 else 0.0
     print(f"📹 Processing from local upright copy: {fixed_path}")
     print(f"📹 {total_frames} frames at {fps:.1f} FPS ({duration:.1f}s)")
 
+    frame_idx = 0
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -1216,70 +1315,144 @@ async def analyze_video_from_url(url: str):
         image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = analyzer.pose.process(image_rgb)
         if results.pose_landmarks:
-            landmarks_over_time.append(results.pose_landmarks.landmark)
+            landmarks_by_frame[frame_idx] = results.pose_landmarks.landmark
+        frame_idx += 1
 
     cap.release()
 
+    landmarks_over_time = list(landmarks_by_frame.values())
     if len(landmarks_over_time) < 10:
-        return ([{"message": "Insufficient pose detection. Ensure clear view of full body throughout the swing."}], {})
+        return ([{"message": "Insufficient pose detection. Ensure full body is visible during swing."}], {})
 
     print(f"🧠 Analyzing {len(landmarks_over_time)} frames with pose data...")
 
-    # ----- your existing analysis below -----
+    # --- DETECT HANDEDNESS ---
     handedness_result = analyzer.detect_handedness_fusion(landmarks_over_time)
     handedness = handedness_result["handedness"]
     print(f"🤚 Detected handedness: {handedness} (confidence: {handedness_result.get('confidence', 0):.2f})")
 
+    # --- SWING PHASE DETECTION ---
     swing_phases = analyzer.detect_precise_swing_timing(landmarks_over_time, handedness)
-
-    foot_plant_frame = swing_phases.get("foot_plant")
+    swing_start = swing_phases.get("swing_start")
+    contact = swing_phases.get("contact")
+    foot_plant = swing_phases.get("foot_plant")
 
     print("⏱️ Swing phases detected:")
     for phase, frame in swing_phases.items():
         if frame is not None:
-            t = frame / fps if fps and fps > 0 else frame * 0.033
-            print(f"   • {phase.replace('_',' ').title()}: Frame {frame} ({t:.2f}s)")
+            print(f"   • {phase.replace('_',' ').title()}: Frame {frame} ({frame / fps:.2f}s)")
         else:
             print(f"   • {phase.replace('_',' ').title()}: Not detected")
 
-    
+    # --- TIME TO CONTACT ---
+    time_to_contact = None
+    if swing_start is not None and contact is not None and fps > 0:
+        time_to_contact = round((contact - swing_start) / fps, 3)
+        print(f"⚡ Time to Contact: {time_to_contact:.3f} seconds")
+
+    # --- HAND SPEED ---
+    hand_speed_metrics = {}
+    if swing_start is not None and contact is not None:
+        hand_speed_metrics = analyzer.calculate_hand_speed_metrics_mph(
+            landmarks_by_frame=landmarks_by_frame,
+            swing_start=swing_start,
+            contact=contact,
+            fps=fps,
+            assumed_shoulder_width_m=0.45
+        )
+        if hand_speed_metrics:
+            peak_mph = hand_speed_metrics.get("peak_hand_speed_mph")
+            avg_mph = hand_speed_metrics.get("average_hand_speed_mph")
+            peak_frame = hand_speed_metrics.get("frame_of_peak_speed")
+            print(f"💨 Peak Hand Speed: {peak_mph:.2f} MPH")
+            print(f"📊 Avg Hand Speed: {avg_mph:.2f} MPH")
+
+    # --- ATTACK ANGLE ---
+    attack_angle = None
+    if contact is not None and contact in landmarks_by_frame:
+        attack_angle = calculate_attack_angle_from_landmarks(
+            landmarks_by_frame[contact], handedness
+        )
+        print(f"🎯 Attack Angle: {attack_angle}°")
+
+    # --- HIP–SHOULDER SEPARATION ---
+    hip_shoulder_separation = None
+    if foot_plant is not None and foot_plant in landmarks_by_frame:
+        try:
+            lm = landmarks_by_frame[foot_plant]
+            ls = lm[mp_pose.PoseLandmark.LEFT_SHOULDER.value]
+            rs = lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value]
+            lh = lm[mp_pose.PoseLandmark.LEFT_HIP.value]
+            rh = lm[mp_pose.PoseLandmark.RIGHT_HIP.value]
+
+            shoulder_angle = np.degrees(np.arctan2(rs.y - ls.y, rs.x - ls.x))
+            hip_angle = np.degrees(np.arctan2(rh.y - lh.y, rh.x - lh.x))
+            hip_shoulder_separation = abs(((shoulder_angle - hip_angle + 180) % 360) - 180)
+
+            print(f"📏 Hip-Shoulder Separation: {hip_shoulder_separation:.1f}°")
+        except Exception as e:
+            print(f"⚠️ Failed to compute hip-shoulder separation: {e}")
+
+    # --- FEEDBACK ---
     detected_phases = [p for p, f in swing_phases.items() if f is not None]
     if len(detected_phases) < 3:
         feedback.append({
             "frame": "overall",
-            "issue": f"Only {len(detected_phases)} of 5 swing phases detected clearly",
-            "suggested_drill": "Ensure video captures complete swing from stance through follow-through",
+            "issue": f"Only {len(detected_phases)} of 5 swing phases detected",
+            "suggested_drill": "Ensure full swing is visible from setup to follow-through",
             "severity": "medium"
         })
 
-    if swing_phases.get("swing_start") and swing_phases.get("contact"):
-        swing_duration = swing_phases["contact"] - swing_phases["swing_start"]
+    if swing_start and contact:
+        swing_duration = contact - swing_start
         if swing_duration < 8:
             feedback.append({
-                "frame": swing_phases["swing_start"],
+                "frame": swing_start,
                 "issue": f"Very quick swing ({swing_duration} frames)",
-                "suggested_drill": "Consider working on tempo and timing control",
+                "suggested_drill": "Work on swing tempo and timing",
+                "severity": "low"
+            })
+
+    if hand_speed_metrics.get("peak_hand_speed_mph", 0) < 15:
+        feedback.append({
+            "frame": hand_speed_metrics.get("frame_of_peak_speed", contact),
+            "issue": f"Peak hand speed is low ({hand_speed_metrics.get('peak_hand_speed_mph', 0):.1f} MPH)",
+            "suggested_drill": "Train bat acceleration with resistance drills or weighted bats",
+            "severity": "medium"
+        })
+
+    if time_to_contact:
+        if time_to_contact > 0.22:
+            feedback.append({
+                "frame": contact,
+                "issue": f"Slow time to contact ({time_to_contact:.2f}s)",
+                "suggested_drill": "Improve quickness through pitch recognition and swing triggers",
+                "severity": "medium"
+            })
+        elif time_to_contact < 0.14:
+            feedback.append({
+                "frame": contact,
+                "issue": f"Very fast time to contact ({time_to_contact:.2f}s)",
+                "suggested_drill": "Check for early commitment or overly aggressive load",
                 "severity": "low"
             })
 
     if handedness == "unknown":
         feedback.append({
             "frame": "setup",
-            "issue": "Could not determine handedness reliably",
-            "suggested_drill": "Ensure clear side view showing batting stance and initial setup",
+            "issue": "Handedness could not be determined",
+            "suggested_drill": "Ensure clear side view of batter's face and stance",
             "severity": "high"
         })
     elif handedness_result.get("confidence", 0) < 0.7:
         feedback.append({
             "frame": "setup",
-            "issue": f"Handedness detection has moderate confidence ({handedness_result['confidence']:.2f})",
-            "suggested_drill": "Verify analysis results - ensure clear side view of batting stance",
+            "issue": f"Low confidence in handedness detection ({handedness_result['confidence']:.2f})",
+            "suggested_drill": "Improve side-angle view of the setup phase",
             "severity": "low"
         })
 
-    #data_quality = separation_analysis.get('data_quality', 0.0)
-  
-
+    # --- FINAL RESULTS ---
     biomarker_results = {
         "handedness": handedness_result,
         "swing_phases": swing_phases,
@@ -1292,128 +1465,147 @@ async def analyze_video_from_url(url: str):
             "input_url": url,
             "rotation_deg": rotation_deg,
             "was_rotated": was_rotated
+        },
+        "metrics": {
+            "time_to_contact_seconds": time_to_contact,
+            "peak_hand_speed_mph": hand_speed_metrics.get("peak_hand_speed_mph"),
+            "average_hand_speed_mph": hand_speed_metrics.get("average_hand_speed_mph"),
+            "frame_of_peak_speed": hand_speed_metrics.get("frame_of_peak_speed"),
+            "attack_angle": attack_angle,
+            "hip_shoulder_separation": hip_shoulder_separation
         }
     }
 
-    print("✅ Analysis complete (rotation handled locally).")
-    return feedback or [{"message": "No major issues detected."}], biomarker_results, fixed_path
+    print("✅ Analysis complete.")
+    return (
+        feedback or [{"message": "No major issues detected."}],
+        biomarker_results,
+        fixed_path,
+        landmarks_by_frame,
+        time_to_contact,
+        hand_speed_metrics,
+        attack_angle,
+        hip_shoulder_separation
+    )
+
+
 
 # ---------------- Annotated video generator (works with upright video) ----------------
 
-async def generate_annotated_video(input_path: str, swing_phases: dict, handedness) -> str:
+async def generate_annotated_video(
+    input_path: str,
+    swing_phases: dict,
+    handedness: str,
+    landmarks_by_frame: dict[int, list],
+    time_to_contact: float | None = None,
+    hand_speed_metrics: dict | None = None,
+    attack_angle: float | None = None,
+    hip_shoulder_separation: float | None = None
+) -> str:
     """
-    Generate an annotated upright video saved as 'annotated_output.mp4'.
-    Handles rotation correction if needed.
+    Annotates the input video with biomechanical feedback overlays.
+    Returns the path to the annotated output video.
     """
 
-    # Ensure the video is upright
-    fixed_path, was_rotated, rotation_deg = fix_rotation_if_needed(input_path)
+    def draw_label(frame, text, y_offset):
+        cv2.putText(frame, text, (30, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 2)
+        cv2.putText(frame, text, (30, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 1)
 
+    def draw_label_black(frame, text, y_offset):
+        cv2.putText(frame, text, (30, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+        cv2.putText(frame, text, (30, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 1)
+
+
+    def draw_phase_title(frame, label):
+        cv2.putText(frame, label, (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 3)
+        cv2.putText(frame, label, (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 1)
+
+    def draw_joint_lines(frame, landmarks, width, height):
+        def to_px(pt): return int(pt.x * width), int(pt.y * height)
+
+        ls = to_px(landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value])
+        rs = to_px(landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value])
+        lh = to_px(landmarks[mp_pose.PoseLandmark.LEFT_HIP.value])
+        rh = to_px(landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value])
+
+        cv2.line(frame, ls, rs, (0, 255, 255), 3)
+        cv2.line(frame, lh, rh, (255, 0, 255), 3)
+
+    # Ensure proper orientation
+    fixed_path, was_rotated, _ = fix_rotation_if_needed(input_path)
     cap = cv2.VideoCapture(fixed_path)
     if not cap.isOpened():
-        raise Exception("Failed to open video for annotation")
+        raise IOError(f"❌ Failed to open video: {fixed_path}")
 
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 1280)
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 720)
+    width, height = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    print(f"📐 Input video (upright): {width}x{height} at {fps:.1f} FPS ({total_frames} frames)")
+    print(f"🎞️ Annotating {total_frames} frames ({fps:.1f} FPS) from {fixed_path}")
 
-    pose = mp_pose.Pose(static_image_mode=False)
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     output_path = "annotated_output.mp4"
-    writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
 
     frame_idx = 0
-    frames_written = 0
-
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = pose.process(image_rgb)
+        landmarks = landmarks_by_frame.get(frame_idx)
+        if landmarks:
+            mp_drawing.draw_landmarks(
+                frame,
+                landmark_pb2.NormalizedLandmarkList(landmark=landmarks),
+                mp_pose.POSE_CONNECTIONS
+            )
 
-        if results.pose_landmarks:
-            mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+            # Phase-specific overlays
+            if frame_idx == swing_phases.get("foot_plant"):
+                draw_joint_lines(frame, landmarks, width, height)
+                if hip_shoulder_separation is not None:
+                    draw_label_black(frame, f"Hip-Shoulder Sep: {hip_shoulder_separation:.1f} degrees", 90)
 
-            # Annotate hip-shoulder separation at foot plant
-            if swing_phases.get("foot_plant") == frame_idx:
-                landmarks = results.pose_landmarks.landmark
-                def denorm(p): return (int(p.x * width), int(p.y * height))
-
-                ls = denorm(landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value])
-                rs = denorm(landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value])
-                lh = denorm(landmarks[mp_pose.PoseLandmark.LEFT_HIP.value])
-                rh = denorm(landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value])
-
-                cv2.line(frame, ls, rs, (0, 255, 255), 3)   # shoulders: yellow
-                cv2.line(frame, lh, rh, (255, 0, 255), 3)   # hips: magenta
-
-                shoulder_angle = np.degrees(np.arctan2(rs[1] - ls[1], rs[0] - ls[0]))
-                hip_angle = np.degrees(np.arctan2(rh[1] - lh[1], rh[0] - lh[0]))
-                separation = abs(((shoulder_angle - hip_angle + 180) % 360) - 180)
-
-                cv2.putText(
-                    frame, f"Hip-Shoulder Sep: {separation:.1f} degrees",
-                    (30, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 2
-                )
-
-        if swing_phases.get("contact") == frame_idx:
-                # Calculate attack angle
-                attack_angle = calculate_attack_angle_from_landmarks(results.pose_landmarks.landmark, handedness)
-                
+            if frame_idx == swing_phases.get("contact"):
                 if attack_angle is not None:
-                    cv2.putText(
-                        frame,
-                        f"Attack Angle: {attack_angle:.1f} degrees",
-                        (30, 130),  # Y-position below other annotations
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.9,
-                        (0, 0, 0),
-                        2
-                    )
+                    draw_label_black(frame, f"Attack Angle: {attack_angle:.1f} degrees", 130)
+                if time_to_contact is not None:
+                    draw_label_black(frame, f"Time to Contact: {time_to_contact:.2f}s", 170)
+                if hand_speed_metrics:
+                    peak = hand_speed_metrics.get("peak_hand_speed_mph")
+                    avg = hand_speed_metrics.get("average_hand_speed_mph")
+                    peak_frame = hand_speed_metrics.get("frame_of_peak_speed")
 
+                    if peak is not None:
+                        draw_label_black(frame, f"Peak Hand Speed: {peak:.2f} MPH", 210)
+                    if avg is not None:
+                        draw_label_black(frame, f"Avg Hand Speed: {avg:.2f} MPH", 250)
 
-        # Add swing phase label if present
-        for phase, f in swing_phases.items():
-            if f == frame_idx:
-                label = phase.replace("_", " ").title()
-                color = {
-                    "stride_start": (0, 0, 0),
-                    "foot_plant": (0, 0, 0),
-                    "swing_start": (0, 0, 0),
-                    "contact": (0, 0, 0),
-                    "follow_through": (0, 0, 0)
-                }.get(phase, (0, 0, 0))
-                cv2.putText(frame, label, (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3)
-                cv2.putText(frame, label, (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 1)
+        # Phase name annotation
+        for phase_name, phase_frame in swing_phases.items():
+            if phase_frame == frame_idx:
+                draw_phase_title(frame, phase_name.replace("_", " ").title())
 
-        # Frame counter
-        cv2.putText(frame, f"Frame {frame_idx}", (30, height - 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        # Frame index
+        cv2.putText(frame, f"Frame {frame_idx}", (30, height - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
         writer.write(frame)
-        frames_written += 1
         frame_idx += 1
 
     cap.release()
     writer.release()
-    pose.close()
 
-    print(f"✅ Annotated video written to: {output_path} ({frames_written} frames)")
+    print(f"✅ Annotated video saved: {output_path}")
 
-    # Clean up rotated temp file if needed
-    try:
-        if was_rotated and os.path.exists(fixed_path):
+    if was_rotated:
+        try:
             os.remove(fixed_path)
-            print(f"🗑️ Cleaned up rotated temp file: {fixed_path}")
-    except Exception as e:
-        print(f"⚠️ Cleanup error: {e}")
+            print(f"🧹 Removed temp rotated file: {fixed_path}")
+        except Exception as e:
+            print(f"⚠️ Failed to clean up temp file: {e}")
 
     return output_path
+
 
 # ---------------- Download helper ----------------
 
