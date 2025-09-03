@@ -23,6 +23,8 @@ import Animated, {
   withDelay,
 } from 'react-native-reanimated';
 import { LinearGradient } from 'expo-linear-gradient';
+import uuid from 'react-native-uuid';
+
 
 const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
 
@@ -42,6 +44,8 @@ interface UploadHistoryItem {
   score: number;
   date: Date;
 }
+
+
 
 export default function UploadScreen() {
   // UI-only state
@@ -263,8 +267,9 @@ export default function UploadScreen() {
     const blob = await res.blob();
     return blob;
   }
+  
 
-  async function uploadVideoToSupabase(fileUri: string, type: UploadType): Promise<string> {
+  async function uploadVideoToSupabase(fileUri: string, type: UploadType): Promise<{ signedUrl: string; filePath: string }> {
     try {
       const base64 = await FileSystem.readAsStringAsync(fileUri, {
         encoding: FileSystem.EncodingType.Base64,
@@ -275,8 +280,8 @@ export default function UploadScreen() {
         throw new Error('User is not authenticated');
       }
 
-      const timestamp = Date.now();
-      const filePath = `${type}-${timestamp}.mp4`;
+      const uniqueId = uuid.v4() as string;
+      const filePath = `${type}-${uniqueId}.mp4`;
       const contentType = 'video/mp4';
 
       const { error } = await supabase.storage
@@ -298,11 +303,31 @@ export default function UploadScreen() {
         throw new Error('Failed to generate signed URL');
       }
 
-      return signedUrlData.signedUrl;
+      return { signedUrl: signedUrlData.signedUrl, filePath };
     } catch (err: any) {
       throw err;
     }
   }
+
+  async function deleteVideoFromSupabase(filePath: string): Promise<boolean> {
+    try {
+      const { error } = await supabase.storage
+        .from('mechanics-uploads-bucket')
+        .remove([filePath]);
+
+      if (error) {
+        console.error('Failed to delete video:', error.message);
+        return false;
+      }
+
+      console.log('✅ Deleted video:', filePath);
+      return true;
+    } catch (err: any) {
+      console.error('Error deleting video from Supabase:', err.message);
+      return false;
+    }
+  }
+
 
   async function analyzeWithBackend(publicUrl: string): Promise<any[]> {
     try {
@@ -310,7 +335,7 @@ export default function UploadScreen() {
         `http://192.168.1.19:8000/analyze?public_url=${encodeURIComponent(publicUrl)}`
       );
       const result = await response.json();
-      Alert.alert('Analysis Result', JSON.stringify(result.feedback, null, 2));
+      Alert.alert('Analysis Result', result.feedback.replace(/\\n/g, '\n'));
       return result.feedback;
     } catch (err) {
       Alert.alert('Error', 'Analysis failed. Please try again.');
@@ -320,15 +345,19 @@ export default function UploadScreen() {
 
   async function handleVideoUpload(type: UploadType, fileUri: string) {
     setIsUploading(true);
+
+    let filePath: string | null = null;
+
     try {
-      const videoUrl = await uploadVideoToSupabase(fileUri, type);
+      const { signedUrl, filePath: path } = await uploadVideoToSupabase(fileUri, type);
+      filePath = path;
 
       let retries = 0;
       let success = false;
       let lastStatus = 0;
 
       while (retries < 10 && !success) {
-        const response = await fetch(videoUrl);
+        const response = await fetch(signedUrl);
         lastStatus = response.status;
         if (response.ok) {
           success = true;
@@ -348,21 +377,24 @@ export default function UploadScreen() {
 
       await new Promise(resolve => setTimeout(resolve, 5000));
 
-      const feedback = await analyzeWithBackend(videoUrl);
+      const feedback = await analyzeWithBackend(signedUrl);
 
       const score = +(7 + Math.random() * 3).toFixed(1);
       setHistory([{ type, score, date: new Date() }, ...history]);
 
-      Alert.alert(
-        'Analysis Complete!',
-        `Your swing video has been analyzed.\n\nTop Feedback:\n${feedback[0]?.issue ?? 'No issues found!'}`
-      );
     } catch (err: any) {
       Alert.alert('Upload Failed', err.message);
     } finally {
       setIsUploading(false);
+
+      // ✅ CLEANUP: delete video from Supabase
+      if (filePath) {
+        //console.log('Cleaning up uploaded video from Supabase...');
+        await deleteVideoFromSupabase(filePath);
+      }
     }
   }
+
 
   const pickOrRecordVideo = async (source: 'camera' | 'library') => {
     let result;
@@ -579,42 +611,7 @@ export default function UploadScreen() {
                   )}
                 </Pressable>
               </Animated.View>
-
-              {isUploading && (
-                <View style={styles.processingContainer}>
-                  <ThemedText style={styles.processingText}>🤖 SCANNING MECHANICS...</ThemedText>
-                  <ThemedText style={styles.processingSubtext}>Diamond Vision AI at work</ThemedText>
-                </View>
-              )}
             </View>
-          </View>
-
-          <View style={styles.section}>
-            <ThemedText type="subtitle" style={styles.sectionTitle}>
-              📊 SWING HISTORY
-            </ThemedText>
-            {history.length === 0 && (
-              <ThemedText style={styles.emptyState}>
-                No swings analyzed yet. Step into the lab.
-              </ThemedText>
-            )}
-            {history.map((item, idx) => (
-              <View style={styles.historyItem} key={idx}>
-                <View style={styles.historyBadge}>
-                  <ThemedText style={styles.historyBadgeText}>#{history.length - idx}</ThemedText>
-                </View>
-                <View style={styles.historyInfo}>
-                  <ThemedText type="defaultSemiBold" style={styles.historyTitle}>
-                    Swing Analysis
-                  </ThemedText>
-                  <ThemedText style={styles.historyDate}>{formatTimeAgo(item.date)}</ThemedText>
-                </View>
-                <View style={styles.scoreContainer}>
-                  <ThemedText style={styles.historyScore}>{item.score}</ThemedText>
-                  <ThemedText style={styles.scoreLabel}>/10</ThemedText>
-                </View>
-              </View>
-            ))}
           </View>
         </View>
       </View>

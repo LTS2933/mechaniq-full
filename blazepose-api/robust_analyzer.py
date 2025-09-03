@@ -11,6 +11,7 @@ import json
 from typing import Dict, List, Tuple, Optional
 import ffmpeg
 import uuid
+import random
 from mediapipe.framework.formats import landmark_pb2
 
 # NEW: supabase-py client
@@ -1399,43 +1400,232 @@ async def analyze_video_from_url(url: str):
         feedback.append({
             "frame": "overall",
             "issue": f"Only {len(detected_phases)} of 5 swing phases detected",
-            "suggested_drill": "Ensure full swing is visible from setup to follow-through",
+            "suggested_drill": "Ensure full swing is visible from setup to follow-through. If the setup looks good, individual swing variations can sometimes affect phase detection accuracy.",
             "severity": "medium"
         })
 
-    if swing_start and contact:
-        swing_duration = contact - swing_start
-        if swing_duration < 8:
+
+    great_hand_speed_options = [
+        "Your hand speed is great ({:.1f} MPH) — explosive and fast through the zone.",
+        "Your hand speed is excellent ({:.1f} MPH), fueling your bat speed and adjustability.",
+        "Your hand speed is amazing ({:.1f} MPH) — few hitters move the barrel this quickly."
+    ]
+
+    good_hand_speed_options = [
+        "Your hand speed is strong ({:.1f} MPH), giving you solid power and reactivity.",
+        "You have very good hand quickness ({:.1f} MPH) that helps you stay competitive.",
+        "Your hands are moving fast ({:.1f} MPH), generating good momentum through the swing."
+    ]
+
+    average_hand_speed_options = [
+        "Your hand speed is solid ({:.1f} MPH) — consistent, but not yet explosive.",
+        "You've got decent hand movement ({:.1f} MPH), but adding quickness could help.",
+        "Your swing shows average hand speed ({:.1f} MPH), though more strength would help."
+    ]
+
+    poor_hand_speed_options = [
+        "Your hand speed is a bit slow ({:.1f} MPH), which might be affecting your power.",
+        "Your hands are moving too slowly ({:.1f} MPH), which might take a toll on other parts of your swing.",
+        "Your swing lacks explosiveness ({:.1f} MPH), and low hand speed is a factor."
+    ]
+
+    great_hip_shoulder_separation_options = [
+        "You're generating elite rotational separation ({:.1f}°), unlocking top-end swing power.",
+        "This is textbook hip-shoulder separation ({:.1f}°) — a key ingredient in high-level hitting.",
+        "Impressive separation angle ({:.1f}°)! You're storing up serious torque before release."
+    ]
+
+    good_hip_shoulder_separation_options = [
+        "Your separation is efficient ({:.1f}°), helping transfer energy through the swing.",
+        "You're sequencing well ({:.1f}°) — a reliable foundation for powerful contact.",
+        "Nice job creating tension between your hips and shoulders ({:.1f}°)."
+    ]
+
+    average_hip_shoulder_separation_options = [
+        "You're getting some separation ({:.1f}°), but more stretch could boost your power.",
+        "There's a decent gap in your rotation ({:.1f}°), but it's not fully optimized yet.",
+        "You're on the right track with sequencing ({:.1f}°), but could improve torque generation."
+    ]
+
+    poor_hip_shoulder_separation_options = [
+        "Your hips and shoulders are turning too much in sync ({:.1f}°), limiting force buildup.",
+        "Very little separation ({:.1f}°) — you're losing out on rotational power.",
+        "Your swing could benefit from more coil and delay in upper-body rotation ({:.1f}°)."
+    ]
+
+    great_time_to_contact_options = [
+        "Lightning-quick reaction time ({:.2f}s) — this gives you elite adjustability at the plate.",
+        "That's a compact, direct swing ({:.2f}s) — you're staying short to the ball.",
+        "Your hands get to the ball fast ({:.2f}s), giving you a real edge against velocity."
+    ]
+
+    good_time_to_contact_options = [
+        "Solid bat speed through the zone ({:.2f}s) — you're handling timing well.",
+        "You're connecting in good time ({:.2f}s), showing smooth mechanics.",
+        "Good quickness ({:.2f}s) — you have a reliable window to read the pitch."
+    ]
+
+    average_time_to_contact_options = [
+        "Your swing reaches contact at a fair pace ({:.2f}s), but could be sharper.",
+        "You're reacting reasonably well ({:.2f}s), though a quicker move would help.",
+        "Time to contact is decent ({:.2f}s) — you might be on time often, but not always ahead."
+    ]
+
+    poor_time_to_contact_options = [
+        "You're lagging behind ({:.2f}s) — that delay may cost you against faster arms.",
+        "Long swing path ({:.2f}s) might make it tough to handle high velocity.",
+        "You're starting too late or moving too slowly ({:.2f}s) — try refining swing efficiency."
+    ]
+
+    great_attack_angle_options = [
+        "You're creating excellent lift ({:.1f}°), but be cautious — if your swing is too steep, it could lead to frequent pop-ups.",
+        "This attack angle ({:.1f}°) gives you power potential, but make sure your bat path isn't overly upward — balance matters.",
+        "Solid upward path ({:.1f}°)! Just be careful not to get under the ball too much — line drives should still be the goal."
+    ]
+
+
+    good_attack_angle_options = [
+        "Your attack angle ({:.1f}°) is in a great spot for driving the ball — just watch out for the occasional pop-up.",
+        "This is a healthy trajectory ({:.1f}°) for line drives — keep it up, but avoid over-tilting or uppercutting.",
+        "Really solid swing path ({:.1f}°)! You're in a strong position — just stay mindful of barrel control through the zone."
+    ]
+
+    average_attack_angle_options = [
+        "Your attack angle is great ({:.1f}°) — you're right in the ideal range. Just make sure you're not rolling over or pounding too many ground balls.",
+        "That's a strong angle ({:.1f}°)! Keep focusing on staying through the zone to avoid hitting the top half of the ball.",
+        "This swing path ({:.1f}°) is definitely in the sweet spot — just be cautious of closing off too early and driving the ball into the ground."
+    ]
+
+    poor_attack_angle_options = [
+        "Your shoulder tilt and bat path ({:.1f}°) aren't ideal — this can lead to a lot of ground balls or rollover contact.",
+        "Attack angle is off ({:.1f}°), making it tough to elevate the ball — likely resulting in weak grounders.",
+        "This angle ({:.1f}°) suggests a flat or downward swing — you're probably hitting too many balls into the ground."
+    ]
+
+
+    # -- HIP SHOULDER SEPARATION --
+    if hip_shoulder_separation is not None:
+        if hip_shoulder_separation < 10:
             feedback.append({
-                "frame": swing_start,
-                "issue": f"Very quick swing ({swing_duration} frames)",
-                "suggested_drill": "Work on swing tempo and timing",
+                "frame": foot_plant,
+                "issue": random.choice(poor_hip_shoulder_separation_options).format(hip_shoulder_separation),
+                "suggested_drill": "Focus on separating hips and shoulders by delaying upper body rotation.",
+                "severity": "high"
+            })
+        elif hip_shoulder_separation < 17:
+            feedback.append({
+                "frame": foot_plant,
+                "issue": random.choice(average_hip_shoulder_separation_options).format(hip_shoulder_separation),
+                "suggested_drill": "Practice coil drills or use medicine ball throws to build rotational torque.",
+                "severity": "medium"
+            })
+        elif hip_shoulder_separation < 26:
+            feedback.append({
+                "frame": foot_plant,
+                "issue": random.choice(good_hip_shoulder_separation_options).format(hip_shoulder_separation),
+                "suggested_drill": "Work on timing your torso rotation for max torque.",
+                "severity": "low"
+            })
+        else:
+            feedback.append({
+                "frame": foot_plant,
+                "issue": random.choice(great_hip_shoulder_separation_options).format(hip_shoulder_separation),
+                "suggested_drill": "Maintain this level of separation in your swing.",
                 "severity": "low"
             })
 
+    if attack_angle is not None:
+        if attack_angle < 0:
+            feedback.append({
+                "frame": contact, 
+                "issue": random.choice(poor_attack_angle_options).format(attack_angle),
+                "suggested_drill": "Try high tee or angled barrel path drills to reduce downward swing and stay behind the ball.",
+                "severity": "high"
+            })
+        elif attack_angle < 11:
+            feedback.append({
+                "frame": contact,
+                "issue": random.choice(average_attack_angle_options).format(attack_angle),
+                "suggested_drill": "Keep your bat in the zone longer — front toss with focus on line drives can reinforce this path.",
+                "severity": "medium"
+            })
+        elif attack_angle < 20:
+            feedback.append({
+                "frame": contact,
+                "issue": random.choice(good_attack_angle_options).format(attack_angle),
+                "suggested_drill": "Continue with controlled front toss or short-bat drills to maintain plane efficiency.",
+                "severity": "low"
+            })
+        else:
+            feedback.append({
+                "frame": contact,
+                "issue": random.choice(great_attack_angle_options).format(attack_angle),
+                "suggested_drill": "To avoid getting under the ball, use a low tee or target line drives up the middle during BP.",
+                "severity": "low"
+            })
+
+
+    # -- HAND SPEED --
     if hand_speed_metrics.get("peak_hand_speed_mph", 0) < 15:
         feedback.append({
             "frame": hand_speed_metrics.get("frame_of_peak_speed", contact),
-            "issue": f"Peak hand speed is low ({hand_speed_metrics.get('peak_hand_speed_mph', 0):.1f} MPH)",
-            "suggested_drill": "Train bat acceleration with resistance drills or weighted bats",
+            "issue": random.choice(poor_hand_speed_options).format(hand_speed_metrics.get("peak_hand_speed_mph", 0)),
+            "suggested_drill": "Use overload/underload bat training or resistance bands to build explosive bat speed.",
+            "severity": "medium"
+        })
+    elif hand_speed_metrics.get("peak_hand_speed_mph", 0) < 19:
+        feedback.append({
+            "frame": hand_speed_metrics.get("frame_of_peak_speed", contact),
+            "issue": random.choice(average_hand_speed_options).format(hand_speed_metrics.get("peak_hand_speed_mph", 0)),
+            "suggested_drill": "Try medicine ball rotational throws and quick-twitch bat speed circuits to improve hand acceleration.",
+            "severity": "medium"
+        })
+    elif hand_speed_metrics.get("peak_hand_speed_mph", 0) < 23:
+        feedback.append({
+            "frame": hand_speed_metrics.get("frame_of_peak_speed", contact),
+            "issue": random.choice(good_hand_speed_options).format(hand_speed_metrics.get("peak_hand_speed_mph", 0)),
+            "suggested_drill": "Maintain tempo with short-bat rapid swings and continue bat speed tracking in front toss.",
+            "severity": "medium"
+        })
+    else:
+        feedback.append({
+            "frame": hand_speed_metrics.get("frame_of_peak_speed", contact),
+            "issue": random.choice(great_hand_speed_options).format(hand_speed_metrics.get("peak_hand_speed_mph", 0)),
+            "suggested_drill": "Stick with your current progression — consider refining timing with resistance bands or plyo bat work.",
             "severity": "medium"
         })
 
-    if time_to_contact:
-        if time_to_contact > 0.22:
+    # -- TIME TO CONTACT --
+    if time_to_contact is not None:
+        if time_to_contact > 0.19:
             feedback.append({
                 "frame": contact,
-                "issue": f"Slow time to contact ({time_to_contact:.2f}s)",
-                "suggested_drill": "Improve quickness through pitch recognition and swing triggers",
+                "issue": f"Slow time to contact ({time_to_contact:.2f}s) — you may be reacting late to pitches.",
+                "suggested_drill": "Use short reaction front toss or live BP with timing cues to speed up decision-making and barrel path.",
+                "severity": "high"
+            })
+        elif time_to_contact > 0.17:
+            feedback.append({
+                "frame": contact,
+                "issue": f"Moderate time to contact ({time_to_contact:.2f}s) — slightly behind the ideal range.",
+                "suggested_drill": "Improve swing efficiency with two-strike drills and fast-paced tee work focused on quick hands.",
                 "severity": "medium"
             })
-        elif time_to_contact < 0.14:
+        elif time_to_contact > 0.16:
             feedback.append({
                 "frame": contact,
-                "issue": f"Very fast time to contact ({time_to_contact:.2f}s)",
-                "suggested_drill": "Check for early commitment or overly aggressive load",
+                "issue": f"Good time to contact ({time_to_contact:.2f}s) — well within the optimal range.",
+                "suggested_drill": "Reinforce consistency with short bat quick fire rounds or machine BP at varying speeds.",
                 "severity": "low"
             })
+        else:
+            feedback.append({
+                "frame": contact,
+                "issue": f"Elite time to contact ({time_to_contact:.2f}s) — you're getting to the ball extremely quickly.",
+                "suggested_drill": "Maintain this efficiency with challenge fastball reps and refine pitch recognition to avoid over-triggering.",
+                "severity": "low"
+            })
+
 
     if handedness == "unknown":
         feedback.append({
@@ -1444,11 +1634,11 @@ async def analyze_video_from_url(url: str):
             "suggested_drill": "Ensure clear side view of batter's face and stance",
             "severity": "high"
         })
-    elif handedness_result.get("confidence", 0) < 0.7:
+    elif handedness_result.get("confidence", 0) < 0.2:
         feedback.append({
             "frame": "setup",
             "issue": f"Low confidence in handedness detection ({handedness_result['confidence']:.2f})",
-            "suggested_drill": "Improve side-angle view of the setup phase",
+            "suggested_drill": "Improve setup with a clearer view or with better lighting",
             "severity": "low"
         })
 
@@ -1476,9 +1666,23 @@ async def analyze_video_from_url(url: str):
         }
     }
 
+    # --- FORMAT USER-FRIENDLY FEEDBACK ---
+    user_friendly_feedback = []
+
+    for entry in feedback:
+        issue = entry.get("issue", "").strip()
+        drill = entry.get("suggested_drill", "").strip()
+
+        if issue and drill:
+            user_friendly_feedback.append(f"{issue} Recommended drill: {drill}")
+        elif issue:
+            user_friendly_feedback.append(issue)
+
+    final_feedback_paragraph = "\n\n".join(user_friendly_feedback)
+
     print("✅ Analysis complete.")
     return (
-        feedback or [{"message": "No major issues detected."}],
+        final_feedback_paragraph or "No major issues detected.",
         biomarker_results,
         fixed_path,
         landmarks_by_frame,
@@ -1487,7 +1691,6 @@ async def analyze_video_from_url(url: str):
         attack_angle,
         hip_shoulder_separation
     )
-
 
 
 # ---------------- Annotated video generator (works with upright video) ----------------
@@ -1512,13 +1715,22 @@ async def generate_annotated_video(
         cv2.putText(frame, text, (30, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 1)
 
     def draw_label_black(frame, text, y_offset):
-        cv2.putText(frame, text, (30, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
-        cv2.putText(frame, text, (30, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 1)
-
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.9
+        font_thickness = 2
+        text_size, _ = cv2.getTextSize(text, font, font_scale, font_thickness)
+        x, y = 30, y_offset - text_size[1]
+        rect_width, rect_height = text_size[0] + 10, text_size[1] + 16
+        cv2.rectangle(frame, (x - 5, y - 5), (x - 5 + rect_width, y - 5 + rect_height), (0, 0, 0), -1)
+        cv2.putText(frame, text, (x, y + text_size[1]), font, font_scale, (255, 255, 255), 1, cv2.LINE_AA)
 
     def draw_phase_title(frame, label):
-        cv2.putText(frame, label, (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 3)
-        cv2.putText(frame, label, (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 1)
+        x_offset = 200
+        y_offset = 35
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.9
+        thickness_fg = 1
+        cv2.putText(frame, label, (x_offset, y_offset), font, font_scale, (255, 255, 255), thickness_fg, cv2.LINE_AA)
 
     def draw_joint_lines(frame, landmarks, width, height):
         def to_px(pt): return int(pt.x * width), int(pt.y * height)
@@ -1581,13 +1793,14 @@ async def generate_annotated_video(
                     if avg is not None:
                         draw_label_black(frame, f"Avg Hand Speed: {avg:.2f} MPH", 250)
 
+        # Frame index
+        cv2.rectangle(frame, (0, 0), (width, 50), (0, 0, 0), -1)
+        cv2.putText(frame, f"Frame: {frame_idx}", (30, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
         # Phase name annotation
         for phase_name, phase_frame in swing_phases.items():
             if phase_frame == frame_idx:
                 draw_phase_title(frame, phase_name.replace("_", " ").title())
-
-        # Frame index
-        cv2.putText(frame, f"Frame {frame_idx}", (30, height - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
         writer.write(frame)
         frame_idx += 1
@@ -1628,3 +1841,5 @@ async def _download_temp(url: str) -> str:
     
     print(f"📥 Downloaded video to: {tmp_path}")
     return tmp_path
+
+
