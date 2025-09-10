@@ -1,11 +1,11 @@
 // app/(tabs)/_layout.tsx
 import { Tabs } from 'expo-router';
-import { Ionicons, MaterialCommunityIcons, Feather } from '@expo/vector-icons';
+import { Ionicons, MaterialCommunityIcons, Feather, FontAwesome5 } from '@expo/vector-icons';
 import { useColorScheme } from 'react-native';
 
 export default function TabLayout() {
   const themeColor = '#1a2e25';
-  const activeTint = '#f44336'; // red accent like your button
+  const activeTint = '#f44336'; // red accent
   const inactiveTint = '#a5d6a7';
 
   return (
@@ -22,7 +22,7 @@ export default function TabLayout() {
         tabBarActiveTintColor: activeTint,
         tabBarInactiveTintColor: inactiveTint,
         tabBarLabelStyle: {
-          fontSize: 12,
+          fontSize: 10,
           fontWeight: '600',
         },
       }}
@@ -39,9 +39,27 @@ export default function TabLayout() {
       <Tabs.Screen
         name="swings"
         options={{
-          title: 'Recent Swings',
+          title: 'History',
           tabBarIcon: ({ color, size }) => (
             <MaterialCommunityIcons name="history" size={size} color={color} />
+          ),
+        }}
+      />
+      <Tabs.Screen
+        name="faq"
+        options={{
+          title: 'Guide',
+          tabBarIcon: ({ color, size }) => (
+            <FontAwesome5 name="question-circle" size={size} color={color} />
+          ),
+        }}
+      />
+      <Tabs.Screen
+        name="drills"
+        options={{
+          title: 'Drills',
+          tabBarIcon: ({ color, size }) => (
+            <FontAwesome5 name="dumbbell" size={size} color={color} />
           ),
         }}
       />

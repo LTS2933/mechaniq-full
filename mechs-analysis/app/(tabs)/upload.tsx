@@ -320,7 +320,7 @@ export default function UploadScreen() {
         return false;
       }
 
-      console.log('✅ Deleted video:', filePath);
+      //console.log('✅ Deleted video:', filePath);
       return true;
     } catch (err: any) {
       console.error('Error deleting video from Supabase:', err.message);
@@ -329,14 +329,14 @@ export default function UploadScreen() {
   }
 
 
-  async function analyzeWithBackend(publicUrl: string): Promise<any[]> {
+  async function analyzeWithBackend(publicUrl: string): Promise<any> {
     try {
       const response = await fetch(
-        `http://192.168.1.19:8000/analyze?public_url=${encodeURIComponent(publicUrl)}`
+        `http://192.168.1.186:8000/analyze?public_url=${encodeURIComponent(publicUrl)}`
       );
       const result = await response.json();
       Alert.alert('Analysis Result', result.feedback.replace(/\\n/g, '\n'));
-      return result.feedback;
+      return result;
     } catch (err) {
       Alert.alert('Error', 'Analysis failed. Please try again.');
       return [];
@@ -345,13 +345,14 @@ export default function UploadScreen() {
 
   async function handleVideoUpload(type: UploadType, fileUri: string) {
     setIsUploading(true);
-
     let filePath: string | null = null;
 
     try {
+      // 1. Upload video to Supabase bucket
       const { signedUrl, filePath: path } = await uploadVideoToSupabase(fileUri, type);
       filePath = path;
 
+      // 2. Poll until the signed URL is ready
       let retries = 0;
       let success = false;
       let lastStatus = 0;
@@ -375,11 +376,39 @@ export default function UploadScreen() {
         return;
       }
 
-      await new Promise(resolve => setTimeout(resolve, 5000));
+      await new Promise(resolve => setTimeout(resolve, 5000)); // Optional buffer
 
-      const feedback = await analyzeWithBackend(signedUrl);
+      // 3. Send to backend for analysis
+      const result = await analyzeWithBackend(signedUrl);
+      if (!result) return;
 
-      const score = +(7 + Math.random() * 3).toFixed(1);
+      const { uuid, s3_key, feedback } = result;
+
+      const { data: sessionData } = await supabase.auth.getSession();
+      const userId = sessionData.session?.user?.id;
+
+      if (!userId) {
+        Alert.alert('Error', 'User not authenticated');
+        return;
+      }
+
+      const { error: insertError } = await supabase.from('Swing').insert([
+        {
+          user_id: userId,
+          feedback: feedback,
+          uniqueid: uuid,
+          s3_key: s3_key,
+        }
+      ]);
+
+      if (insertError) {
+        console.error('❌ Failed to insert swing row:', insertError);
+      } else {
+        //console.log('✅ Logged swing to Supabase');
+      }
+
+      // 5. Optional: local history state update
+      const score = +(7 + Math.random() * 3).toFixed(1); // Fake score
       setHistory([{ type, score, date: new Date() }, ...history]);
 
     } catch (err: any) {
@@ -387,9 +416,8 @@ export default function UploadScreen() {
     } finally {
       setIsUploading(false);
 
-      // ✅ CLEANUP: delete video from Supabase
+      // 6. Delete original upload from Supabase storage
       if (filePath) {
-        //console.log('Cleaning up uploaded video from Supabase...');
         await deleteVideoFromSupabase(filePath);
       }
     }

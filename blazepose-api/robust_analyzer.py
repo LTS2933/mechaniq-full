@@ -13,6 +13,7 @@ import ffmpeg
 import uuid
 import random
 from mediapipe.framework.formats import landmark_pb2
+from statistics import median
 
 # NEW: supabase-py client
 from supabase import create_client, Client
@@ -429,6 +430,8 @@ class RobustBaseballSwingAnalyzer:
             'back_heel_x': [], 'back_heel_y': [],
             'lead_foot_index_x': [], 'lead_foot_index_y': [],
             'back_foot_index_x': [], 'back_foot_index_y': [],
+            'lead_hand_x': [], 'lead_hand_y': [],
+            'back_hand_x': [], 'back_hand_y': [],
         }
 
         landmark_indices = {
@@ -449,6 +452,8 @@ class RobustBaseballSwingAnalyzer:
             'back_heel':    getattr(mp_pose.PoseLandmark, f'{back_side}_HEEL').value,
             'lead_foot_index': getattr(mp_pose.PoseLandmark, f'{lead_side}_FOOT_INDEX').value,
             'back_foot_index': getattr(mp_pose.PoseLandmark, f'{back_side}_FOOT_INDEX').value,
+            'lead_hand':    getattr(mp_pose.PoseLandmark, f'{lead_side}_INDEX').value,
+            'back_hand':    getattr(mp_pose.PoseLandmark, f'{back_side}_INDEX').value,
         }
 
         # Face landmarks (optional; we won't reject the frame if these are missing)
@@ -742,23 +747,29 @@ class RobustBaseballSwingAnalyzer:
 
         return None if not return_debug else (None, debug_info)
 
+    def _detect_contact_adaptive(self, data, swing_start, video_length, handedness: str, verbose: bool = True):
+        """
+        Detect contact based on back wrist positioning relative to hand cluster.
+        For left-handed hitters: back wrist is down and to the right from cluster
+        For right-handed hitters: back wrist is down and to the left from cluster
 
-
-    def _detect_contact_adaptive(self, data, swing_start, video_length, handedness: str):
-        """Contact detection using elbow angle instead of arm length."""
+        Uses the same lead/back definitions from _extract_adaptive_movement_data:
+        - Left-handed: lead_side = "RIGHT", back_side = "LEFT"
+        - Right-handed: lead_side = "LEFT", back_side = "RIGHT"
+        """
 
         if swing_start is None:
             print("❌ _detect_contact_adaptive: swing_start is None")
             return None
 
-        # --- locate swing_start index ---
+        # Locate start index
         start_idx = next((i for i, f in enumerate(data['frames']) if f >= swing_start), 0)
 
-        # --- fixed window after swing start ---
+        # Window setup
         WINDOW_SECONDS = 4.0
         fps_est = 30.0
         window_frames = int(round(fps_est * WINDOW_SECONDS))
-        end_idx = min(start_idx + window_frames, len(data['lead_wrist_x']) - 1)
+        end_idx = min(start_idx + window_frames, len(data['back_wrist_x']) - 1)
 
         if end_idx - start_idx < 6:
             print("🚫 contact: too few frames in window after swing_start")
@@ -777,113 +788,108 @@ class RobustBaseballSwingAnalyzer:
                 x = gaussian_filter1d(x, sigma=sigma)
             return x
 
-        # Smooth coordinates
-        lsx = _smooth1d(data['lead_shoulder_x'], 0.8)
-        lsy = _smooth1d(data['lead_shoulder_y'], 0.8)
-        lex = _smooth1d(data['lead_elbow_x'],   0.8)
-        ley = _smooth1d(data['lead_elbow_y'],   0.8)
-        lwx = _smooth1d(data['lead_wrist_x'],   0.8)
-        lwy = _smooth1d(data['lead_wrist_y'],   0.8)
+        # Smooth joint data
+        lwx = _smooth1d(data['lead_wrist_x'], 0.6)
+        lwy = _smooth1d(data['lead_wrist_y'], 0.6)
+        bwx = _smooth1d(data['back_wrist_x'], 0.6)
+        bwy = _smooth1d(data['back_wrist_y'], 0.6)
+        lhx = _smooth1d(data['lead_hand_x'], 0.6)
+        lhy = _smooth1d(data['lead_hand_y'], 0.6)
+        bhx = _smooth1d(data['back_hand_x'], 0.6)
+        bhy = _smooth1d(data['back_hand_y'], 0.6)
+        lkx = _smooth1d(data['lead_knee_x'], 0.6)
 
-        # === Elbow angle calculation ===
-        def elbow_angle_deg(sx, sy, ex, ey, wx, wy):
-            SE = np.sqrt((sx - ex)**2 + (sy - ey)**2)
-            EW = np.sqrt((ex - wx)**2 + (ey - wy)**2)
-            SW = np.sqrt((sx - wx)**2 + (sy - wy)**2)
-            if SE == 0 or EW == 0:
-                return np.nan
-            cos_theta = (SE**2 + EW**2 - SW**2) / (2 * SE * EW)
-            cos_theta = np.clip(cos_theta, -1.0, 1.0)
-            return np.degrees(np.arccos(cos_theta))
+        def calculate_contact_score(idx):
+            target_x, target_y = bwx[idx], bwy[idx]  # back wrist
+            cluster_points = [(lwx[idx], lwy[idx]), (lhx[idx], lhy[idx]), (bhx[idx], bhy[idx])]
 
-        elbow_angles = np.array([
-            elbow_angle_deg(lsx[i], lsy[i], lex[i], ley[i], lwx[i], lwy[i])
-            for i in range(len(lsx))
-        ])
+            if not all(np.isfinite(p[0]) and np.isfinite(p[1]) for p in cluster_points):
+                return 0.0
+            if not (np.isfinite(target_x) and np.isfinite(target_y)):
+                return 0.0
 
-        # Threshold for "almost straight" arm
-        ANGLE_THRESH = 160.0
-        SECONDARY_ANGLE_THRESH = 145.0
+            cluster_x = np.mean([p[0] for p in cluster_points])
+            cluster_y = np.mean([p[1] for p in cluster_points])
+            dx = target_x - cluster_x
+            dy = target_y - cluster_y
+
+            score = 0.0
+
+            if dy > 0.02:
+                score += 0.4
+            elif dy > 0.01:
+                score += 0.2
+
+            if handedness == "left":
+                if dx > 0.03:
+                    score += 0.4
+                elif dx > 0.015:
+                    score += 0.2
+            elif handedness == "right":
+                if dx < -0.03:
+                    score += 0.4
+                elif dx < -0.015:
+                    score += 0.2
+
+            diagonal_distance = np.sqrt(dx**2 + dy**2)
+            if diagonal_distance > 0.04:
+                score += 0.2
+
+            lead_knee_x = lkx[idx]
+            if handedness == "right" and cluster_x > lead_knee_x:
+                score += 0.6
+            elif handedness == "left" and cluster_x < lead_knee_x:
+                score += 0.6
+
+            if handedness == "left" and dx < -0.01:
+                score -= 0.3
+            elif handedness == "right" and dx > 0.01:
+                score -= 0.3
+
+            if dy < -0.01:
+                score -= 0.2
+
+            return score
+
+        best_idx = None
+        best_score = 0.0
 
 
-        # Hands-ahead-of-face check
-        hx = 0.5 * (np.asarray(data['lead_wrist_x'], float) + np.asarray(data['back_wrist_x'], float))
-        hx_s = _smooth1d(hx, 0.6)
-        face_x = np.asarray(data.get('face_center_x', []), float)
-        have_face = (len(face_x) == len(hx_s))
-        face_x_s = _smooth1d(face_x, 0.8) if have_face else face_x
-        sign = +1.0 if handedness == 'right' else (-1.0 if handedness == 'left' else None)
-        margin = 0.065
-
-        def hands_ahead(idx: int) -> bool:
-            if not (have_face and sign is not None):
-                return False
-            if not (np.isfinite(hx_s[idx]) and np.isfinite(face_x_s[idx])):
-                return False
-            diff = sign * (hx_s[idx] - face_x_s[idx])
-            return diff >= margin
-
-        bex = _smooth1d(data['back_elbow_x'], 0.6)
-
-        def back_elbow_ahead(idx: int) -> bool:
-            if not (have_face and sign is not None):
-                return False
-            if not (np.isfinite(bex[idx]) and np.isfinite(face_x_s[idx])):
-                return False
-            diff = sign * (bex[idx] - face_x_s[idx])
-            return diff >= margin
-
-
-        # --- DEBUG print ---
-        """
-        print("\n🛠 DEBUG: Frame-by-frame contact search window")
-        print(" idx | frame | elbow_angle | near_full? | hands_ahead? | elbow_ahead? | elbow_ahead_dist")
-        print("-----|-------|-------------|------------|--------------|--------------|------------------")
         for idx in range(start_idx, end_idx + 1):
-            angle = elbow_angles[idx]
-            nf = np.isfinite(angle) and angle >= ANGLE_THRESH
-            ahead = hands_ahead(idx)
+            score = calculate_contact_score(idx)
 
-            # Compute elbow diff
-            if have_face and sign is not None and np.isfinite(bex[idx]) and np.isfinite(face_x_s[idx]):
-                elbow_diff = sign * (bex[idx] - face_x_s[idx])
-                elbow_ahead = elbow_diff >= margin
-            else:
-                elbow_diff = float('nan')
-                elbow_ahead = False
+            if verbose and idx <= start_idx + 10:
+                target_x, target_y = bwx[idx], bwy[idx]
+                cluster_points = [(lwx[idx], lwy[idx]), (lhx[idx], lhy[idx]), (bhx[idx], bhy[idx])]
+                cluster_x = np.mean([p[0] for p in cluster_points])
+                cluster_y = np.mean([p[1] for p in cluster_points])
+                dx = target_x - cluster_x
+                dy = target_y - cluster_y
+                lead_knee_x = lkx[idx]
 
-            print(f"{idx:4d} | {int(data['frames'][idx]):5d} | {angle:11.2f} | {str(nf):>10} | {str(ahead):>12} | {str(elbow_ahead):>12} | {elbow_diff:16.4f}")
-        """
+                if handedness == "right":
+                    cluster_vs_knee = "✔️" if cluster_x > lead_knee_x else "❌"
+                elif handedness == "left":
+                    cluster_vs_knee = "✔️" if cluster_x < lead_knee_x else "❌"
+                else:
+                    cluster_vs_knee = "—"
 
-        
+                frame_num = int(data['frames'][idx])
+                print(f"{idx:4d} | {frame_num:5d} | ({target_x:5.3f},{target_y:5.3f}) | ({cluster_x:5.3f},{cluster_y:5.3f}) | {dx:7.3f} | {dy:7.3f} | {score:5.3f} | {cluster_vs_knee}")
 
-        # === Selection logic ===
-        # Step 1: earliest frame with straight arm & hands ahead
-        earliest_idx = None
-        for idx in range(start_idx, end_idx + 1):
-            if np.isfinite(elbow_angles[idx]):
-                angle = elbow_angles[idx]
-                if (angle >= ANGLE_THRESH and hands_ahead(idx)) or \
-                (angle >= SECONDARY_ANGLE_THRESH and back_elbow_ahead(idx)):
-                    earliest_idx = idx
-                    break
+            if score > best_score and score >= 0.6:
+                best_score = score
+                best_idx = idx
 
+        if best_idx is not None:
+            print(f"\n🎯 Contact detected at idx={best_idx} "
+                f"(frame={int(data['frames'][best_idx])}, score={best_score:.3f})")
+            return int(data['frames'][best_idx])
 
-        if earliest_idx is not None:
-            print(f"🎯 contact: earliest straight-arm & ahead-of-face at idx={earliest_idx} "
-                f"(frame={int(data['frames'][earliest_idx])}, angle={elbow_angles[earliest_idx]:.2f}°)")
-            return int(data['frames'][earliest_idx])
-
-        # Step 2: fallback to straightest arm
-        valid_idxs = [i for i in range(start_idx, end_idx + 1) if np.isfinite(elbow_angles[i])]
-        if valid_idxs:
-            k = max(valid_idxs, key=lambda i: elbow_angles[i])
-            print(f"ℹ️ no ahead-of-face match; using straightest arm idx={k} "
-                f"(frame={int(data['frames'][k])}, angle={elbow_angles[k]:.2f}°)")
-            return int(data['frames'][k])
-
-        print("🚫 No valid elbow angles for contact detection")
+        print(f"\n🚫 No clear contact position detected (best score: {best_score:.3f})")
         return None
+
+
 
     
     def _detect_follow_through_adaptive(self, data, contact, video_length):
@@ -1003,101 +1009,120 @@ class RobustBaseballSwingAnalyzer:
         return min_frame if min_movement < 0.02 else None
 
     def calculate_hand_speed_metrics_mph(
-        self,
-        landmarks_by_frame: dict[int, List],
-        swing_start: int,
-        contact: int,
-        fps: float,
-        assumed_shoulder_width_m: float = 0.40
-    ) -> dict:
-        """
-        Calculates peak and average hand speed in MPH between swing start and contact.
-        Uses wrist midpoint displacement, normalized by median shoulder width.
-        Returns:
-            {
-                "peak_hand_speed_mph": float,
-                "average_hand_speed_mph": float,
-                "frame_of_peak_speed": int,
-                "hand_speeds_by_frame": dict[int, float]
-            }
-        """
-        if not swing_start or not contact or contact <= swing_start:
+            self,
+            landmarks_by_frame: dict[int, List],
+            swing_start: int,
+            contact: int,
+            stride_start: int,
+            fps: float,
+            handedness: str = "right",
+            assumed_shoulder_width_m: float = 0.40
+        ) -> dict:
+        print(f"\n🔍 Calculating hand speed metrics (lead wrist) from frame {swing_start} to {contact}...")
+
+        if not swing_start or not contact or not stride_start or contact <= swing_start:
             print("🚫 Invalid frame range for hand speed calculation.")
             return {}
 
-        wrist_positions = {}
-        shoulder_widths = []
+        if stride_start not in landmarks_by_frame:
+            print("🚫 Stride start frame not found in landmarks.")
+            return {}
 
-        # Step 1: Gather wrist midpoints and shoulder widths
+        # Step 1: Shoulder width at stride start
+        try:
+            stride_start_landmarks = landmarks_by_frame[stride_start]
+            ls = stride_start_landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value]
+            rs = stride_start_landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value]
+
+            shoulder_width_units = np.sqrt((ls.x - rs.x)**2 + (ls.y - rs.y)**2)
+            print(f"📏 Shoulder width (normalized units): {shoulder_width_units:.4f}")
+            if shoulder_width_units <= 0.01:
+                print("🚫 Invalid shoulder width at foot plant.")
+                return {}
+
+            meters_per_unit = assumed_shoulder_width_m / shoulder_width_units
+            print(f"📐 Meters per unit: {meters_per_unit:.4f}")
+
+        except Exception as e:
+            print(f"🚫 Error getting shoulder width at foot plant: {e}")
+            return {}
+
+        # Step 2: Lead wrist X positions
+        wrist_x_positions = {}
+        lead_wrist_index = mp_pose.PoseLandmark.RIGHT_WRIST.value if handedness == "left" else mp_pose.PoseLandmark.LEFT_WRIST.value
+
+        print("\n🖐️ Lead Wrist X positions:")
         for frame in range(swing_start, contact + 1):
             if frame not in landmarks_by_frame:
+                print(f"⚠️ Frame {frame} missing from landmarks.")
                 continue
 
             try:
                 landmarks = landmarks_by_frame[frame]
-                lw = landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value]
-                rw = landmarks[mp_pose.PoseLandmark.RIGHT_WRIST.value]
-                ls = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value]
-                rs = landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value]
+                wrist = landmarks[lead_wrist_index]
+                wrist_x_positions[frame] = wrist.x
+                print(f"  Frame {frame}: X = {wrist.x:.4f}")
 
-                # Wrist midpoint
-                mx = (lw.x + rw.x) / 2
-                my = (lw.y + rw.y) / 2
-                wrist_positions[frame] = (mx, my)
-
-                # Shoulder width (used later for scale)
-                shoulder_width = np.sqrt((ls.x - rs.x)**2 + (ls.y - rs.y)**2)
-                if shoulder_width > 0.01:  # filter out garbage values
-                    shoulder_widths.append(shoulder_width)
-            except:
+            except Exception as e:
+                print(f"⚠️ Error at frame {frame}: {e}")
                 continue
 
-        if len(wrist_positions) < 2 or not shoulder_widths:
-            print("🚫 Not enough valid pose frames.")
+        if len(wrist_x_positions) < 2:
+            print("🚫 Not enough valid pose frames for hand tracking.")
             return {}
 
-        median_shoulder_width = np.median(shoulder_widths)
-        meters_per_unit = assumed_shoulder_width_m / median_shoulder_width
-
-        # Step 2: Calculate speed between frames
-        prev_frame = None
-        prev_pos = None
+        # Step 3: Speed calculation
+        print("\n🚀 Frame-by-frame ΔX and Speed:")
+        prev_x = None
         speeds_mph = {}
         total_speed = 0
         peak_speed = 0
         peak_frame = swing_start
         count = 0
 
-        for frame in sorted(wrist_positions.keys()):
-            pos = wrist_positions[frame]
-            if prev_pos:
-                dx = pos[0] - prev_pos[0]
-                dy = pos[1] - prev_pos[1]
-                dist_units = np.sqrt(dx**2 + dy**2)
+        start_x = wrist_x_positions[min(wrist_x_positions.keys())]
+        end_x = wrist_x_positions[max(wrist_x_positions.keys())]
+        total_delta_x_units = abs(end_x - start_x)
+        total_horizontal_distance_m = total_delta_x_units * meters_per_unit
 
-                dist_m = dist_units * meters_per_unit
-                speed_mps = dist_m * fps
-                speed_mph = speed_mps * 2.23694  # m/s to MPH
+        for frame in sorted(wrist_x_positions.keys()):
+            current_x = wrist_x_positions[frame]
+
+            if prev_x is not None:
+                delta_x_units = abs(current_x - prev_x)
+                delta_x_m = delta_x_units * meters_per_unit
+                speed_mps = delta_x_m * fps
+                speed_mph = speed_mps * 2.23694
 
                 speeds_mph[frame] = round(speed_mph, 2)
                 total_speed += speed_mph
                 count += 1
 
+                print(f"  Frame {frame}: ΔX = {delta_x_units:.4f}, Speed = {speed_mph:.2f} MPH")
+
                 if speed_mph > peak_speed:
                     peak_speed = speed_mph
                     peak_frame = frame
+            else:
+                print(f"  Frame {frame}: (No previous frame for ΔX)")
 
-            prev_pos = pos
-            prev_frame = frame
+            prev_x = current_x
 
         average_speed = total_speed / count if count else 0
+
+        print(f"\n📊 Summary:")
+        print(f"  ➤ Total horizontal distance (m): {total_horizontal_distance_m:.3f}")
+        print(f"  ➤ Peak speed: {peak_speed:.2f} MPH (Frame {peak_frame})")
+        print(f"  ➤ Average speed: {average_speed:.2f} MPH")
 
         return {
             "peak_hand_speed_mph": round(peak_speed, 2),
             "average_hand_speed_mph": round(average_speed, 2),
             "frame_of_peak_speed": peak_frame,
-            "hand_speeds_by_frame": speeds_mph
+            "hand_speeds_by_frame": speeds_mph,
+            "total_horizontal_distance_m": round(total_horizontal_distance_m, 3)
         }
+
 
 
 
@@ -1159,6 +1184,143 @@ def calculate_attack_angle_from_landmarks(landmarks, handedness: str) -> float |
     except Exception as e:
         print(f"⚠️ Error calculating attack angle proxy: {e}")
         return None
+
+def detect_lunging_metric(landmarks_by_frame, swing_start, contact, handedness) -> dict:
+    """
+    Detects lunging in baseball swing using multiple biomechanical indicators: 
+    1. Back leg push-off angle
+    2. Hip-to-front-ankle relationship
+    3. Weight distribution imbalance
+    4. Front foot movement (stride too far)
+
+    Returns score 0.0-1.0 where >=0.5 indicates lunging
+    """
+    if swing_start is None or contact is None or handedness not in {"left", "right"}:
+        return {"lunge_score": None, "is_lunging": False, "debug": "Invalid inputs"}
+
+    try:
+        lm_start = landmarks_by_frame[swing_start]
+        lm_contact = landmarks_by_frame[contact]
+        
+        # Define side-specific landmarks
+        if handedness == "right":
+            front_ankle = lm_contact[mp_pose.PoseLandmark.LEFT_ANKLE.value]
+            front_knee = lm_contact[mp_pose.PoseLandmark.LEFT_KNEE.value] 
+            front_hip = lm_contact[mp_pose.PoseLandmark.LEFT_HIP.value]
+            back_ankle = lm_contact[mp_pose.PoseLandmark.RIGHT_ANKLE.value]
+            back_knee = lm_contact[mp_pose.PoseLandmark.RIGHT_KNEE.value]
+            back_hip = lm_contact[mp_pose.PoseLandmark.RIGHT_HIP.value]
+            
+            # Starting positions
+            front_ankle_start = lm_start[mp_pose.PoseLandmark.LEFT_ANKLE.value]
+            back_ankle_start = lm_start[mp_pose.PoseLandmark.RIGHT_ANKLE.value]
+        else:
+            front_ankle = lm_contact[mp_pose.PoseLandmark.RIGHT_ANKLE.value]
+            front_knee = lm_contact[mp_pose.PoseLandmark.RIGHT_KNEE.value]
+            front_hip = lm_contact[mp_pose.PoseLandmark.RIGHT_HIP.value] 
+            back_ankle = lm_contact[mp_pose.PoseLandmark.LEFT_ANKLE.value]
+            back_knee = lm_contact[mp_pose.PoseLandmark.LEFT_KNEE.value]
+            back_hip = lm_contact[mp_pose.PoseLandmark.LEFT_HIP.value]
+            
+            # Starting positions  
+            front_ankle_start = lm_start[mp_pose.PoseLandmark.RIGHT_ANKLE.value]
+            back_ankle_start = lm_start[mp_pose.PoseLandmark.LEFT_ANKLE.value]
+
+        # Get torso landmarks
+        nose = lm_contact[mp_pose.PoseLandmark.NOSE.value]
+        left_shoulder = lm_contact[mp_pose.PoseLandmark.LEFT_SHOULDER.value]
+        right_shoulder = lm_contact[mp_pose.PoseLandmark.RIGHT_SHOULDER.value]
+        
+        # Starting positions for comparison
+        nose_start = lm_start[mp_pose.PoseLandmark.NOSE.value]
+        
+        # Calculate stance width for normalization
+        stance_width = abs(front_ankle_start.x - back_ankle_start.x)
+        if stance_width < 0.01:  # Too narrow to analyze
+            return {"lunge_score": None, "is_lunging": False, "debug": "Stance too narrow"}
+
+        lunge_indicators = []
+        debug_info = {}
+
+        def calculate_angle(point1, vertex, point2):
+            """Calculate angle at vertex between two points"""
+            v1 = np.array([point1.x - vertex.x, point1.y - vertex.y])
+            v2 = np.array([point2.x - vertex.x, point2.y - vertex.y])
+            
+            cos_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+            cos_angle = np.clip(cos_angle, -1.0, 1.0)
+            return np.degrees(np.arccos(cos_angle))
+
+        # INDICATOR 1: Back leg push-off angle
+        back_leg_angle = calculate_angle(back_hip, back_knee, back_ankle) 
+        print(f"DEBUG: back_leg_angle = {back_leg_angle}")
+        if back_leg_angle > 165:  # Overly extended back leg
+            lunge_indicators.append(0.25)
+            
+        debug_info["back_leg_angle"] = round(back_leg_angle, 1)
+
+        # INDICATOR 2: Hip vs front ankle position
+        hip_center_x = (front_hip.x + back_hip.x) / 2
+        hip_vs_ankle_distance = abs(hip_center_x - front_ankle.x) / stance_width
+        
+        # Check if hips are too far forward relative to front ankle
+        hip_past_ankle = False
+        if handedness == "right" and hip_center_x > front_ankle.x + stance_width * 0.05:
+            hip_past_ankle = True
+        elif handedness == "left" and hip_center_x < front_ankle.x - stance_width * 0.05:
+            hip_past_ankle = True
+
+        print(f"DEBUG: hip_past_ankle = {hip_past_ankle}")
+            
+        if hip_past_ankle:
+            lunge_indicators.append(0.25)
+            
+        debug_info["hip_vs_ankle_distance"] = round(hip_vs_ankle_distance, 3)
+        debug_info["hip_past_ankle"] = hip_past_ankle
+
+        # INDICATOR 3: Weight distribution (nose forward of back ankle)
+        shoulder_center_x = (left_shoulder.x + right_shoulder.x) / 2
+        torso_lean_ratio = abs(shoulder_center_x - back_ankle.x) / stance_width
+        
+        print(f"DEBUG: torso_lean_ratio = {torso_lean_ratio}")
+        if torso_lean_ratio > 0.7:
+            lunge_indicators.append(1)
+        elif torso_lean_ratio > 0.6:  # Torso too far forward from back foot
+            lunge_indicators.append(0.25)
+            
+        debug_info["torso_lean_ratio"] = round(torso_lean_ratio, 3)
+
+        # INDICATOR 4: Front foot movement (stride too far)
+        front_foot_stride = abs(front_ankle.x - front_ankle_start.x) / stance_width
+        print(f"DEBUG: front_foot_stride = {front_foot_stride}")
+        if front_foot_stride > 0.3:  # Stride more than 30% of original stance
+            lunge_indicators.append(0.1)
+            
+        debug_info["front_foot_stride"] = round(front_foot_stride, 3)
+
+        # Calculate final lunge score
+        lunge_score = min(sum(lunge_indicators), 1.0)
+        is_lunging = lunge_score >= 0.5
+        
+        # Confidence based on how many indicators fired
+        confidence = len([x for x in lunge_indicators if x > 0]) / 4.0
+        
+        debug_info["indicators_fired"] = len([x for x in lunge_indicators if x > 0])
+        debug_info["total_indicators"] = len(lunge_indicators)
+        
+        return {
+            "lunge_score": round(lunge_score, 3),
+            "is_lunging": is_lunging,
+            "confidence": round(confidence, 3), 
+            "debug": debug_info
+        }
+
+    except Exception as e:
+        return {
+            "lunge_score": None, 
+            "is_lunging": False,
+            "debug": f"Error in lunging detection: {str(e)}"
+        }
 
 
 # ---------------- Rotation fix ----------------
@@ -1337,6 +1499,7 @@ async def analyze_video_from_url(url: str):
     swing_start = swing_phases.get("swing_start")
     contact = swing_phases.get("contact")
     foot_plant = swing_phases.get("foot_plant")
+    stride_start = swing_phases.get("stride_start")
 
     print("⏱️ Swing phases detected:")
     for phase, frame in swing_phases.items():
@@ -1358,8 +1521,9 @@ async def analyze_video_from_url(url: str):
             landmarks_by_frame=landmarks_by_frame,
             swing_start=swing_start,
             contact=contact,
-            fps=fps,
-            assumed_shoulder_width_m=0.45
+            stride_start=stride_start,
+            fps=30.0,
+            handedness=handedness
         )
         if hand_speed_metrics:
             peak_mph = hand_speed_metrics.get("peak_hand_speed_mph")
@@ -1403,6 +1567,23 @@ async def analyze_video_from_url(url: str):
             "suggested_drill": "Ensure full swing is visible from setup to follow-through. If the setup looks good, individual swing variations can sometimes affect phase detection accuracy.",
             "severity": "medium"
         })
+
+    lunge_result = detect_lunging_metric(
+        landmarks_by_frame, 
+        swing_start, 
+        contact, 
+        handedness
+    )
+
+    if lunge_result["lunge_score"] is not None:
+        print(f"🧍 Lunge Score: {lunge_result['lunge_score']:.3f}")
+        if lunge_result["is_lunging"]:
+            feedback.append({
+                "frame": contact,
+                "issue": f"Excessive forward drift in hips (lunge score: {lunge_result['lunge_score']:.2f})",
+                "suggested_drill": "Try 'Walk Through Drill' or 'Pause at Launch' to fix lunging.",
+                "severity": "high"
+            })
 
 
     great_hand_speed_options = [
@@ -1696,6 +1877,7 @@ async def analyze_video_from_url(url: str):
 # ---------------- Annotated video generator (works with upright video) ----------------
 
 async def generate_annotated_video(
+    video_uuid,
     input_path: str,
     swing_phases: dict,
     handedness: str,
@@ -1793,9 +1975,23 @@ async def generate_annotated_video(
                     if avg is not None:
                         draw_label_black(frame, f"Avg Hand Speed: {avg:.2f} MPH", 250)
 
-        # Frame index
+        # Top bar
         cv2.rectangle(frame, (0, 0), (width, 50), (0, 0, 0), -1)
+
+        # Frame index (left side)
         cv2.putText(frame, f"Frame: {frame_idx}", (30, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+        # Right-aligned UUID
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.6
+        font_thickness = 1
+        text_size, _ = cv2.getTextSize(video_uuid, font, font_scale, font_thickness)
+
+        uuid_x = width - text_size[0] - 30  # 30px padding from right
+        uuid_y = 35
+
+        cv2.putText(frame, video_uuid, (uuid_x, uuid_y), font, font_scale, (255, 255, 255), font_thickness, cv2.LINE_AA)
+
 
         # Phase name annotation
         for phase_name, phase_frame in swing_phases.items():
